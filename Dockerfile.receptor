@@ -1,0 +1,22 @@
+ARG BASE_IMAGE=quay.io/ansible/receptor:latest
+
+FROM ${BASE_IMAGE}
+
+USER 0
+
+# Install podman and dependencies for process isolation
+RUN dnf install -y \
+    podman \
+    podman-docker \
+    socat \
+    slirp4netns \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+# Create symlink for podman discovery
+RUN ln -sf /usr/bin/podman /usr/local/bin/podman
+
+# Configure user namespaces for podman
+RUN echo "user.max_user_namespaces=28633" >> /etc/sysctl.conf
+
+WORKDIR /var/lib/receptor

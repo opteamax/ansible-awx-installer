@@ -1,0 +1,86 @@
+# Custom AWX image with podman pre-installed for process isolation
+ARG BASE_IMAGE=quay.io/ansible/awx:24.6.1
+ARG RECEPTOR_IMAGE=quay.io/ansible/receptor:latest
+
+FROM ${RECEPTOR_IMAGE} AS receptor_source
+FROM ${BASE_IMAGE}
+
+USER root
+
+# Reuse the receptor binary so the receptor service can run from the AWX image.
+COPY --from=receptor_source /usr/bin/receptor /usr/bin/receptor
+
+# Install podman and dependencies for process isolation
+RUN dnf install -y \
+    podman \
+    podman-docker \
+    socat \
+    slirp4netns \
+    && dnf clean all
+
+# Create podman symlink in /usr/local/bin for PATH discovery
+RUN ln -sf /usr/bin/podman /usr/local/bin/podman
+
+# Expose ansible-runner from the AWX virtualenv for receptor-launched work.
+RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-runner /usr/local/bin/ansible-runner
+
+# AWX task images do not ship ansible-playbook in this venv; install ansible-core
+# so project updates can execute without nested process isolation.
+RUN /var/lib/awx/venv/awx/bin/pip install --no-cache-dir ansible-core==2.16.14
+RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-playbook /usr/local/bin/ansible-playbook
+
+# Nested podman in Docker cannot rely on cgroup controllers from the outer runtime.
+RUN mkdir -p /etc/containers \
+    && printf '[containers]\ncgroups = "disabled"\n' > /etc/containers/containers.conf
+
+# Project updates should run without nested process isolation to avoid runner
+# payload/path mismatches when launched through receptor.
+RUN python3 - <<'PY'
+from pathlib import Path
+
+path = Path('/var/lib/awx/venv/awx/lib/python3.11/site-packages/awx/main/tasks/jobs.py')
+text = path.read_text()
+old_playbook = """    def build_playbook_path_relative_to_cwd(self, project_update, private_data_dir):
+        return '/var/lib/awx/venv/awx/lib/python3.11/site-packages/awx/playbooks/project_update.yml'
+"""
+new_playbook = """    def build_playbook_path_relative_to_cwd(self, project_update, private_data_dir):
+        return os.path.join('project_update.yml')
+"""
+if old_playbook in text:
+    text = text.replace(old_playbook, new_playbook, 1)
+
+old_params = """    def build_execution_environment_params(self, instance, private_data_dir):
+        if settings.IS_K8S:
+            return {}
+
+        params = super(RunProjectUpdate, self).build_execution_environment_params(instance, private_data_dir)
+        project_path = instance.get_project_path(check_if_exists=False)
+        cache_path = instance.get_cache_path()
+        params.setdefault('container_volume_mounts', [])
+        params['container_volume_mounts'].extend(
+            [
+                f\"{project_path}:{project_path}:z\",
+                f\"{cache_path}:{cache_path}:z\",
+            ]
+        )
+        return params
+"""
+new_params = """    def build_execution_environment_params(self, instance, private_data_dir):
+        return {'process_isolation': False}
+"""
+if old_params not in text:
+    raise SystemExit('RunProjectUpdate build_execution_environment_params target not found')
+path.write_text(text.replace(old_params, new_params, 1))
+PY
+
+# Ensure /usr/local/bin is in PATH
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Configure podman for rootless/unprivileged operation in container
+RUN echo "user.max_user_namespaces=28633" >> /etc/sysctl.conf
+
+# Set working directory
+WORKDIR /var/lib/awx
+
+LABEL description="AWX image with podman for process isolation" \
+      version="24.6.1-podman"
