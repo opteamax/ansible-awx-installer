@@ -296,6 +296,10 @@ class PlatformAdapter:
     def service_is_active(self, name: str) -> bool:
         return run_ok(["systemctl", "is-active", "--quiet", name])
 
+    def pre_nginx_install(self) -> None:
+        """Hook run before installing the nginx package. No-op by default."""
+        pass
+
     def nginx_conf_dir(self) -> str:
         raise NotImplementedError
 
@@ -332,6 +336,12 @@ class RHEL9Adapter(PlatformAdapter):
 
     def service_reload(self, name: str) -> None:
         run(["systemctl", "reload", name])
+
+    def pre_nginx_install(self) -> None:
+        # RHEL 9 ships nginx 1.20 in the default AppStream stream. The AWX
+        # tooling needs a newer release, so enable the nginx:1.26 module
+        # before the package is installed.
+        run(["dnf", "module", "enable", "-y", "nginx:1.26"])
 
     def nginx_conf_dir(self) -> str:
         return "/etc/nginx/conf.d"
@@ -4375,6 +4385,7 @@ def install_nginx(platform_adapter: PlatformAdapter, state: State) -> None:
         return
 
     log.info("Installing NGINX ...")
+    platform_adapter.pre_nginx_install()
     platform_adapter.pkg_install(["nginx"])
     platform_adapter.service_enable_now("nginx")
     state.complete("nginx_install")
