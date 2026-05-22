@@ -28,6 +28,13 @@ RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-runner /usr/local/bin/ansible-runne
 # so project updates can execute without nested process isolation.
 RUN /var/lib/awx/venv/awx/bin/pip install --no-cache-dir ansible-core==2.16.14
 RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-playbook /usr/local/bin/ansible-playbook
+# Project content-sync runs in the control plane (see jobs.py patch below) and
+# the "Fetch galaxy collections from collections/requirements.(yml/yaml)" task
+# shells out to `ansible-galaxy`; without this symlink it fails with
+# "[Errno 2] No such file or directory: b'ansible-galaxy'". ansible-inventory is
+# exposed too for any control-plane inventory operations.
+RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-galaxy /usr/local/bin/ansible-galaxy
+RUN ln -sf /var/lib/awx/venv/awx/bin/ansible-inventory /usr/local/bin/ansible-inventory
 
 # Nested podman in Docker cannot rely on cgroup controllers from the outer runtime.
 RUN mkdir -p /etc/containers \

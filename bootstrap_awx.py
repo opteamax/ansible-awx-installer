@@ -241,12 +241,13 @@ class Config:
     platform: str = ""  # rhel9 | debian13 | ubuntu2204 | ubuntu2404
     fips_enabled: bool = False
     selinux_mode: str = "disabled"  # enforcing | permissive | disabled
-    ssl_mode: str = "none"  # none | provided | certbot_http | certbot_dns
+    ssl_mode: str = "none"  # none | provided | certbot_http | certbot_dns | acme_sh
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
     certbot_email: str = ""
     certbot_dns_provider: str = ""
     certbot_dns_plugin_source: str = ""  # pip or git URL
+    acme_sh_basedir: str = "/root/.acme.sh"  # dir containing acme.sh (HTTP-01 via --nginx)
     db_mode: str = "container"  # container | external
     db_host: str = "postgres"
     db_port: int = 5432
@@ -267,6 +268,64 @@ class Config:
     nginx_https_port: int = 443
     expose_postgres_port: bool = False
     netbox_url: str = ""
+    netbox_token: str = ""  # secret — excluded from answers file
+    # --- Infisical (self-hosted secrets manager, co-located on the AWX host) ---
+    infisical_enabled: bool = False
+    infisical_fqdn: str = ""
+    infisical_image: str = "infisical/infisical:latest"
+    infisical_bind_host: str = "127.0.0.1"
+    infisical_bind_port: int = 8080
+    infisical_redis_image: str = "redis:7-alpine"
+    # AWX compose network infisical joins to reach the shared "postgres" service.
+    # docker compose namespaces the AWX compose's "awx_net" with its project name
+    # (the compose/awx dir) -> "awx_awx_net".
+    infisical_awx_network: str = "awx_awx_net"
+    # Infisical reuses AWX's PostgreSQL container (shared instance). These are the
+    # role/db created for Infisical on that server; the superuser used to create
+    # them is AWX's db_user with the AWX db password the installer generates.
+    infisical_db_name: str = "infisical"
+    infisical_db_user: str = "infisical"
+    # Optional SMTP smart-host relay (blank host = disabled). Password is a secret.
+    # Transport: STARTTLS (explicit upgrade, usually :587) or SMTPS (implicit TLS,
+    # usually :465). SMTP_AUTH uses the username/password below.
+    infisical_smtp_host: str = ""
+    infisical_smtp_port: int = 587
+    infisical_smtp_protocol: str = "STARTTLS"  # STARTTLS | SMTPS
+    infisical_smtp_user: str = ""
+    infisical_smtp_from_address: str = ""
+    infisical_smtp_from_name: str = "Infisical"
+    # Machine Identity (Universal Auth) used by the generated infisical lookup.
+    # These only exist after Infisical's first-run seeding; prompted if known.
+    infisical_client_id: str = ""
+    infisical_client_secret: str = ""  # secret — excluded from answers file
+    infisical_smtp_password: str = ""  # secret — excluded from answers file
+    # Project + environment that seeded secrets live in (and that the generated
+    # lookup reads). A project is created during seeding with default envs.
+    infisical_project_name: str = "awx"
+    infisical_env_slug: str = "prod"
+    # How AWX and Infisical users relate:
+    #   none       — independent user stores (only the shared admin is aligned)
+    #   autoinvite — invite AWX-managed users into the Infisical org via its API
+    #   idp        — both use a common external IdP; provisioned by the installer
+    infisical_user_sync: str = "none"  # none | autoinvite | idp
+    # --- LDAP / Microsoft AD (only LDAP for now; other IdPs may be added later) ---
+    # AWX LDAP auth is offered independently of Infisical. Infisical reuses these
+    # same details when infisical_user_sync == "idp".
+    ldap_enabled: bool = False     # enable LDAP/AD auth for AWX
+    idp_type: str = "ldap"  # ldap (AD-compatible)
+    ldap_server_uri: str = ""      # ldap://ad.example.com:389 or ldaps://...:636
+    ldap_start_tls: bool = False
+    ldap_bind_dn: str = ""         # service account DN
+    ldap_bind_password: str = ""   # secret — excluded from answers file
+    ldap_user_search_base: str = ""   # e.g. OU=Users,DC=example,DC=com
+    ldap_user_search_filter: str = "(sAMAccountName=%(user)s)"  # AD default
+    ldap_group_search_base: str = ""  # optional; e.g. OU=Groups,DC=example,DC=com
+    ldap_email_attr: str = "mail"
+    ldap_first_name_attr: str = "givenName"
+    ldap_last_name_attr: str = "sn"
+    # Filled in after seeding (non-secret UUID); baked into group_vars so ansible
+    # runs know which project to read secrets from.
+    infisical_project_id: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +732,10 @@ def prompt_confirm(label: str, default: bool = False) -> bool:
 # excluded because they are re-set on every run from the environment.
 _ANSWERS_EXCLUDE: frozenset = frozenset({
     "awx_admin_password",   # secret — kept only in the encrypted state file
+    "infisical_client_secret",  # secret
+    "infisical_smtp_password",  # secret
+    "netbox_token",         # secret
+    "ldap_bind_password",   # secret
     "platform",             # auto-detected
     "fips_enabled",         # auto-detected
     "selinux_mode",         # auto-detected
@@ -747,6 +810,47 @@ def _validate_nonempty(val: str) -> Optional[str]:
     return None
 
 
+def _collect_ldap_params(cfg: Config, answers: dict) -> None:
+    """Prompt for LDAP / Microsoft AD connection details (used by AWX and/or
+    Infisical). Collected once; safe to call when already partially answered."""
+    print("\n── LDAP / Microsoft AD ───────────────────────────────────")
+    cfg.ldap_server_uri = prompt(
+        "LDAP server URI (ldap://host:389 or ldaps://host:636)",
+        default=answers.get("ldap_server_uri", cfg.ldap_server_uri),
+    )
+    cfg.ldap_start_tls = prompt_confirm(
+        "Use StartTLS (only for ldap:// on port 389; not for ldaps://)?",
+        default=bool(answers.get("ldap_start_tls", cfg.ldap_start_tls)),
+    )
+    cfg.ldap_bind_dn = prompt(
+        "Bind DN (service account), e.g. CN=svc,OU=Users,DC=example,DC=com",
+        default=answers.get("ldap_bind_dn", cfg.ldap_bind_dn),
+    )
+    cfg.ldap_bind_password = prompt_password("Bind account password")
+    cfg.ldap_user_search_base = prompt(
+        "User search base DN, e.g. OU=Users,DC=example,DC=com",
+        default=answers.get("ldap_user_search_base", cfg.ldap_user_search_base),
+    )
+    cfg.ldap_user_search_filter = prompt(
+        "User search filter",
+        default=answers.get("ldap_user_search_filter", cfg.ldap_user_search_filter),
+    )
+    cfg.ldap_group_search_base = prompt(
+        "Group search base DN (blank to skip group sync)",
+        default=answers.get("ldap_group_search_base", cfg.ldap_group_search_base),
+        required=False,
+    )
+    cfg.ldap_email_attr = prompt(
+        "Email attribute", default=answers.get("ldap_email_attr", cfg.ldap_email_attr),
+    )
+    cfg.ldap_first_name_attr = prompt(
+        "First-name attribute", default=answers.get("ldap_first_name_attr", cfg.ldap_first_name_attr),
+    )
+    cfg.ldap_last_name_attr = prompt(
+        "Last-name attribute", default=answers.get("ldap_last_name_attr", cfg.ldap_last_name_attr),
+    )
+
+
 def collect_params(
     platform: str,
     state: State,
@@ -793,7 +897,7 @@ def collect_params(
     cfg.ssl_mode = prompt(
         "SSL mode",
         default=answers.get("ssl_mode", "none"),
-        choices=["none", "provided", "certbot_http", "certbot_dns"],
+        choices=["none", "provided", "certbot_http", "certbot_dns", "acme_sh"],
     )
 
     if cfg.ssl_mode == "provided":
@@ -808,11 +912,17 @@ def collect_params(
             validator=lambda v: None if Path(v).exists() else "File not found",
         )
 
-    if cfg.ssl_mode in ("certbot_http", "certbot_dns"):
+    if cfg.ssl_mode in ("certbot_http", "certbot_dns", "acme_sh"):
         cfg.certbot_email = prompt(
             "Email for Let's Encrypt notifications",
             default=answers.get("certbot_email", "") or cfg.admin_email,
             validator=_validate_email,
+        )
+
+    if cfg.ssl_mode == "acme_sh":
+        cfg.acme_sh_basedir = prompt(
+            "acme.sh base directory (contains the acme.sh script)",
+            default=answers.get("acme_sh_basedir", "/root/.acme.sh"),
         )
 
     if cfg.ssl_mode == "certbot_dns":
@@ -879,7 +989,7 @@ def collect_params(
         ),
     )
     cfg.awx_admin_name = prompt(
-        "AWX admin display name",
+        "AWX admin full name (first word -> First Name, rest -> Last Name)",
         default=str(answers.get("awx_admin_name", "Administrator")),
     )
     cfg.awx_admin_email = prompt(
@@ -920,6 +1030,13 @@ def collect_params(
                 cfg.awx_admin_password = pw1
                 break
             print("  Passwords do not match, try again.")
+
+    # ── Authentication (LDAP / Microsoft AD) ─────────────────────
+    print("\n── Authentication ────────────────────────────────────────")
+    cfg.ldap_enabled = prompt_confirm(
+        "Enable LDAP / Microsoft AD authentication for AWX?",
+        default=bool(answers.get("ldap_enabled", False)),
+    )
 
     # ── Git repository ───────────────────────────────────────────
     print("\n── Git Repository (optional) ─────────────────────────────")
@@ -988,6 +1105,89 @@ def collect_params(
         default=answers.get("netbox_url", ""),
         required=False,
     )
+    if cfg.netbox_url:
+        cfg.netbox_token = prompt_password("NetBox API token (for the dynamic inventory)")
+
+    # ── Infisical (self-hosted secrets manager) ──────────────────
+    print("\n── Infisical (self-hosted secrets manager) ───────────────")
+    cfg.infisical_enabled = prompt_confirm(
+        "Deploy Infisical alongside AWX (shares AWX's PostgreSQL)?",
+        default=bool(answers.get("infisical_enabled", False)),
+    )
+    if cfg.infisical_enabled:
+        cfg.infisical_fqdn = prompt(
+            "Infisical FQDN",
+            default=answers.get("infisical_fqdn", ""),
+            validator=_validate_fqdn,
+        )
+        cfg.infisical_image = prompt(
+            "Infisical container image",
+            default=answers.get("infisical_image", cfg.infisical_image),
+        )
+        cfg.infisical_smtp_host = prompt(
+            "SMTP smart-host for Infisical email (leave blank to disable)",
+            default=answers.get("infisical_smtp_host", ""),
+            required=False,
+        )
+        if cfg.infisical_smtp_host:
+            cfg.infisical_smtp_protocol = prompt(
+                "SMTP transport",
+                default=answers.get("infisical_smtp_protocol", "STARTTLS"),
+                choices=["STARTTLS", "SMTPS"],
+            )
+            default_port = "465" if cfg.infisical_smtp_protocol == "SMTPS" else "587"
+            cfg.infisical_smtp_port = int(prompt(
+                "SMTP port",
+                default=str(answers.get("infisical_smtp_port", default_port)),
+                validator=_validate_port,
+            ))
+            cfg.infisical_smtp_user = prompt(
+                "SMTP username (SMTP_AUTH)",
+                default=answers.get("infisical_smtp_user", ""),
+            )
+            cfg.infisical_smtp_password = prompt_password("SMTP password (SMTP_AUTH)")
+            cfg.infisical_smtp_from_address = prompt(
+                "SMTP From address",
+                default=answers.get("infisical_smtp_from_address", "") or cfg.admin_email,
+                validator=_validate_email,
+            )
+            cfg.infisical_smtp_from_name = prompt(
+                "SMTP From name",
+                default=answers.get("infisical_smtp_from_name", "Infisical"),
+            )
+        # Machine Identity is created during Infisical seeding (Phase 4). If you
+        # already have a Universal Auth identity, its client id can be supplied
+        # now; the client secret is handled as a secret. Leave blank otherwise.
+        cfg.infisical_client_id = prompt(
+            "Infisical Machine Identity client id (blank = create during seeding)",
+            default=answers.get("infisical_client_id", ""),
+            required=False,
+        )
+        if cfg.infisical_client_id:
+            cfg.infisical_client_secret = prompt_password(
+                "Infisical Machine Identity client secret"
+            )
+        # How AWX and Infisical users should relate.
+        print(
+            "  User integration: 'none' = separate user stores; "
+            "'autoinvite' = invite AWX-managed users into Infisical via API; "
+            "'idp' = both use a common external IdP (configured manually)."
+        )
+        cfg.infisical_user_sync = prompt(
+            "AWX <-> Infisical user integration",
+            default=answers.get("infisical_user_sync", "none"),
+            choices=["none", "autoinvite", "idp"],
+        )
+        if cfg.infisical_user_sync == "idp":
+            # Only LDAP / Microsoft AD is supported for now. The LDAP details are
+            # collected once below (shared with AWX LDAP when that is enabled).
+            cfg.idp_type = "ldap"
+            print("  Infisical will use LDAP / Microsoft AD (shared with AWX LDAP).")
+
+    # LDAP / Microsoft AD connection details — collected once when AWX LDAP is
+    # enabled and/or Infisical is set to use an LDAP IdP.
+    if cfg.ldap_enabled or (cfg.infisical_enabled and cfg.infisical_user_sync == "idp"):
+        _collect_ldap_params(cfg, answers)
 
     print()
     return cfg
@@ -1035,6 +1235,14 @@ def run_preflight(config: Config) -> None:
 
     if config.ssl_mode == "provided":
         check_ssl_pair(config.ssl_cert_path, config.ssl_key_path)
+
+    if config.ssl_mode == "acme_sh":
+        acme_bin = Path(config.acme_sh_basedir) / "acme.sh"
+        if not acme_bin.is_file():
+            raise SystemExit(
+                f"ERROR: acme.sh not found at {acme_bin}. Install/configure acme.sh "
+                f"first, or correct the acme.sh base directory."
+            )
 
     ports_to_check = [config.nginx_http_port]
     if config.ssl_mode != "none":
@@ -1242,12 +1450,89 @@ def generate_and_write_secrets(
     os.replace(tmp_env, env_path)
     log.debug("Wrote .env file: %s", env_path)
 
-    log.info("Secret files written to %s", secrets_dir)
-    return {
+    # NetBox API token (for the dynamic inventory). Stored as a secret file for
+    # host-local runs (export NETBOX_TOKEN from it); AWX gets it via a credential.
+    if config.netbox_token:
+        write_secret_file(secrets_dir / "netbox" / "token", config.netbox_token + "\n", uid, gid)
+
+    # LDAP bind-account password (for AWX/Infisical LDAP auth).
+    if config.ldap_bind_password:
+        write_secret_file(secrets_dir / "ldap" / "bind_password", config.ldap_bind_password + "\n", uid, gid)
+
+    result = {
         "db_password": actual_db_pass,
         "secret_key": secret_key,
         "ws_secret": ws_secret,
     }
+
+    # --- Infisical secrets (shares AWX's PostgreSQL container) ---
+    if config.infisical_enabled:
+        inf_encryption_key = state.get("infisical_encryption_key") or _secrets_mod.token_hex(16)
+        inf_auth_secret = state.get("infisical_auth_secret") or generate_secret(32)
+        inf_db_password = state.get("infisical_db_password") or _secrets_mod.token_hex(24)
+        # Admin password for the Infisical instance admin created during seeding.
+        # Reuse the AWX admin password so the operator logs in to Infisical with
+        # the SAME credentials entered in the setup dialog (email = awx_admin_email).
+        # Note: it must satisfy Infisical's password policy or the bootstrap call
+        # will reject it. If no AWX admin password is set, fall back to a generated
+        # policy-compliant one (written to secrets/infisical/admin_password).
+        inf_admin_password = (
+            state.get("infisical_admin_password")
+            or config.awx_admin_password
+            or ("A1!" + generate_secret(24).replace("/", "x").replace("+", "y").replace("=", "z"))
+        )
+        state.set("infisical_encryption_key", inf_encryption_key)
+        state.set("infisical_auth_secret", inf_auth_secret)
+        state.set("infisical_db_password", inf_db_password)
+        state.set("infisical_admin_password", inf_admin_password)
+        write_secret_file(secrets_dir / "infisical" / "admin_password", inf_admin_password + "\n", uid, gid)
+
+        scheme = "http" if config.ssl_mode == "none" else "https"
+        # Infisical reaches AWX's PostgreSQL by service name on the joined docker
+        # network; the container's internal port is always 5432.
+        pg_host = "postgres" if config.db_mode != "external" else config.db_host
+        db_uri = (
+            f"postgresql://{config.infisical_db_user}:{inf_db_password}"
+            f"@{pg_host}:5432/{config.infisical_db_name}"
+        )
+        inf_env_lines = [
+            "NODE_ENV=production",
+            f"ENCRYPTION_KEY={inf_encryption_key}",
+            f"AUTH_SECRET={inf_auth_secret}",
+            f"DB_CONNECTION_URI={db_uri}",
+            "REDIS_URL=redis://redis:6379",
+            f"SITE_URL={scheme}://{config.infisical_fqdn}",
+            "TELEMETRY_ENABLED=false",
+        ]
+        if config.infisical_smtp_host:
+            inf_env_lines += [
+                f"SMTP_HOST={config.infisical_smtp_host}",
+                f"SMTP_PORT={config.infisical_smtp_port}",
+                f"SMTP_USERNAME={config.infisical_smtp_user}",
+                f"SMTP_PASSWORD={config.infisical_smtp_password}",
+                f"SMTP_FROM_ADDRESS={config.infisical_smtp_from_address}",
+                f"SMTP_FROM_NAME={config.infisical_smtp_from_name}",
+            ]
+            # Transport: SMTPS = implicit TLS (SMTP_SECURE=true); STARTTLS =
+            # explicit upgrade (SMTP_SECURE=false + require TLS).
+            if config.infisical_smtp_protocol.upper() == "SMTPS":
+                inf_env_lines.append("SMTP_SECURE=true")
+            else:
+                inf_env_lines.append("SMTP_SECURE=false")
+                inf_env_lines.append("SMTP_REQUIRE_TLS=true")
+        # The infisical compose uses this as its env_file (mode 600).
+        inf_env_path = Path(home) / "compose" / "infisical" / ".env"
+        write_secret_file(inf_env_path, "\n".join(inf_env_lines) + "\n", uid, gid)
+        log.info("Infisical secret env written to %s", inf_env_path)
+
+        result.update({
+            "infisical_encryption_key": inf_encryption_key,
+            "infisical_auth_secret": inf_auth_secret,
+            "infisical_db_password": inf_db_password,
+        })
+
+    log.info("Secret files written to %s", secrets_dir)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1635,6 +1920,11 @@ server {{
     if config.ssl_mode == "provided":
         cert_path = config.ssl_cert_path
         key_path = config.ssl_key_path
+    elif config.ssl_mode == "acme_sh":
+        # acme.sh --install-cert target (see run_acme_sh)
+        acme_dir = f"/etc/nginx/ssl/{fqdn}"
+        cert_path = f"{acme_dir}/fullchain.pem"
+        key_path = f"{acme_dir}/key.pem"
     else:
         # certbot-managed paths
         le_dir = f"/etc/letsencrypt/live/{fqdn}"
@@ -1819,18 +2109,331 @@ def gen_ansible_cfg(config: Config) -> str:
 # ansible.cfg – generated by bootstrap_awx.py
 [defaults]
 inventory          = {home}/inventories/static/hosts.yml
-roles_path         = {home}/roles
-collections_paths  = {home}/ansible/collections:/usr/share/ansible/collections
-log_path           = {home}/logs/ansible.log
+# roles_path / collections_path are repo-relative so they resolve from the
+# project root both for local host runs (cwd = {home}) and when AWX/ansible-runner
+# checks the project out at /runner/project. Absolute {home} paths broke AWX with
+# "role '<name>' not found" because /runner/project/roles was never searched.
+roles_path         = roles
+collections_path   = collections:/usr/share/ansible/collections
+lookup_plugins     = plugins/lookup
+# NB: log_path is intentionally left unset. When AWX runs this project inside
+# its execution-environment container, {home}/logs is not present/writeable,
+# which makes ansible emit a "log file is not writeable" warning on every run.
+# Set ANSIBLE_LOG_PATH in the environment for local/host runs if needed.
 host_key_checking  = False
 retry_files_enabled = False
 forks              = 10
-stdout_callback    = yaml
+# The 'yaml' stdout callback was removed in community.general 12.0.0; the
+# built-in default callback with result_format=yaml gives the same YAML output
+# but works on every community.general version.
+stdout_callback    = ansible.builtin.default
+result_format      = yaml
+
+[inventory]
+# Inventory plugins must be explicitly enabled before they will parse a source.
+# Without netbox.netbox.nb_inventory listed here, ansible-inventory falls back to
+# only the stock plugins (host_list, script, auto, yaml, ini, toml); the 'auto'
+# plugin then fails verify_file() on inventories/dynamic/netbox.yml because the
+# fully-qualified plugin name is not enabled, producing:
+#   "auto declined parsing .../netbox.yml as it did not pass its verify_file()".
+# List the netbox plugin first, then the usual built-ins for static sources.
+enable_plugins = netbox.netbox.nb_inventory, auto, host_list, yaml, ini, toml, script
 
 [ssh_connection]
 pipelining         = True
 ssh_args           = -C -o ControlMaster=auto -o ControlPersist=300s
 """
+
+
+def gen_collections_requirements(config: Config) -> str:
+    """Generate collections/requirements.yml.
+
+    AWX / ansible-runner install collections from collections/requirements.yml
+    during project sync (when content sync is enabled and a Galaxy credential is
+    attached to the organization) — NOT from a root-level requirements.yml. This
+    is also the single source consumed when building a custom execution
+    environment.
+    """
+    netbox_block = ""
+    if config.netbox_url:
+        netbox_block = """\
+  # NetBox dynamic inventory plugin (netbox.netbox.nb_inventory). REQUIRED for
+  # inventories/dynamic/netbox.yml to parse: the 'auto'/netbox inventory plugin
+  # only passes verify_file() once this collection is installed in the EE.
+  - name: netbox.netbox
+    version: ">=3.15.0"
+"""
+    return f"""\
+---
+# Collections required by this AWX project.
+collections:
+  # AWX REST API objects (awx_config role). Already present in the stock awx-ee,
+  # listed so project content sync / a custom EE install/pin it explicitly.
+  - name: awx.awx
+    version: ">=24.6.0"
+{netbox_block}"""
+
+
+def gen_infisical_compose(config: Config) -> str:
+    """docker-compose for Infisical + its own redis, joining AWX's network.
+
+    Infisical reuses AWX's PostgreSQL (reached by service name "postgres" on the
+    joined external network). It binds only to the loopback; the host nginx vhost
+    terminates TLS and proxies to it.
+    """
+    return f"""\
+# Infisical compose – generated by bootstrap_awx.py
+services:
+  infisical:
+    image: "{config.infisical_image}"
+    container_name: infisical
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "{config.infisical_bind_host}:{config.infisical_bind_port}:8080"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - default
+      - awxnet
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:8080/api/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  redis:
+    image: "{config.infisical_redis_image}"
+    container_name: infisical-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - infisical-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  infisical-redis:
+
+networks:
+  default: {{}}
+  awxnet:
+    external: true
+    name: {config.infisical_awx_network}
+"""
+
+
+def gen_infisical_nginx(config: Config) -> str:
+    """Generate the host nginx vhost for Infisical (mirrors gen_nginx_config)."""
+    fqdn = config.infisical_fqdn
+    upstream = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+    proxy = f"""        proxy_pass {upstream};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300;
+        client_max_body_size 25m;"""
+
+    if config.ssl_mode == "none":
+        return f"""\
+# NGINX config for Infisical (HTTP only) – generated by bootstrap_awx.py
+server {{
+    listen {config.nginx_http_port};
+    server_name {fqdn};
+
+    location / {{
+{proxy}
+    }}
+}}
+"""
+
+    if config.ssl_mode == "provided":
+        # Reuses AWX's provided cert; it must cover {fqdn} (SAN/wildcard).
+        cert_path = config.ssl_cert_path
+        key_path = config.ssl_key_path
+    elif config.ssl_mode == "acme_sh":
+        cert_path = f"/etc/nginx/ssl/{fqdn}/fullchain.pem"
+        key_path = f"/etc/nginx/ssl/{fqdn}/key.pem"
+    else:
+        le_dir = f"/etc/letsencrypt/live/{fqdn}"
+        cert_path = f"{le_dir}/fullchain.pem"
+        key_path = f"{le_dir}/privkey.pem"
+
+    return f"""\
+# NGINX config for Infisical (HTTPS) – generated by bootstrap_awx.py
+server {{
+    listen {config.nginx_http_port};
+    server_name {fqdn};
+    return 301 https://$host$request_uri;
+}}
+
+server {{
+    listen {config.nginx_https_port} ssl;
+    http2 on;
+    server_name {fqdn};
+
+    ssl_certificate     {cert_path};
+    ssl_certificate_key {key_path};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {{
+{proxy}
+    }}
+}}
+"""
+
+
+def gen_infisical_lookup_plugin(config: Config) -> str:
+    """Generate plugins/lookup/infisical.py (Token Auth or Universal Auth, stdlib only)."""
+    return r'''from __future__ import absolute_import, division, print_function
+__metaclass__ = type
+
+DOCUMENTATION = r"""
+name: infisical
+short_description: Fetch a secret from a self-hosted Infisical instance
+description:
+  - Retrieves a secret value using either a static Token Auth token or Universal
+    Auth (client id/secret). Uses only the Python standard library.
+options:
+  _terms:
+    description: Secret name(s) to fetch.
+    required: true
+  url:
+    description: Base URL of the Infisical instance.
+    required: true
+  project_id:
+    description: Infisical project (workspace) id.
+    required: true
+  env_slug:
+    description: Environment slug (e.g. prod).
+    required: true
+  path:
+    description: Secret folder path.
+    default: /
+  token:
+    description: Static Token Auth JWT; if set it is used directly.
+    required: false
+  client_id:
+    description: Universal Auth client id (used when token is unset).
+    required: false
+  client_secret:
+    description: Universal Auth client secret.
+    required: false
+  default:
+    description: Value returned on failure instead of raising.
+    required: false
+    type: str
+"""
+
+RETURN = r"""
+_raw:
+  description: Secret value(s) in the order requested.
+  type: list
+  elements: str
+"""
+
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
+
+from ansible.errors import AnsibleError
+from ansible.plugins.lookup import LookupBase
+
+_TOKEN_CACHE = {}
+
+
+class LookupModule(LookupBase):
+
+    def run(self, terms, variables=None, **kwargs):
+        self.set_options(var_options=variables, direct=kwargs)
+        url = self.get_option("url").rstrip("/")
+        project_id = self.get_option("project_id")
+        env_slug = self.get_option("env_slug")
+        path = self.get_option("path")
+        token = self.get_option("token")
+        client_id = self.get_option("client_id")
+        client_secret = self.get_option("client_secret")
+        default = self.get_option("default")
+        has_default = default is not None
+
+        try:
+            access = token or self._login(url, client_id, client_secret)
+        except AnsibleError:
+            if has_default:
+                return [default for _ in terms]
+            raise
+        if not access:
+            if has_default:
+                return [default for _ in terms]
+            raise AnsibleError("infisical lookup: no token or client credentials provided")
+
+        out = []
+        for name in terms:
+            try:
+                out.append(self._fetch(url, access, project_id, env_slug, path, name))
+            except AnsibleError:
+                if has_default:
+                    out.append(default)
+                else:
+                    raise
+        return out
+
+    def _login(self, url, client_id, client_secret):
+        if not client_id or not client_secret:
+            return None
+        key = (url, client_id)
+        if key in _TOKEN_CACHE:
+            return _TOKEN_CACHE[key]
+        endpoint = url + "/api/v1/auth/universal-auth/login"
+        payload = json.dumps({"clientId": client_id, "clientSecret": client_secret}).encode()
+        req = urllib.request.Request(
+            endpoint, data=payload,
+            headers={"Content-Type": "application/json"}, method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+        except Exception as exc:  # noqa: BLE001
+            raise AnsibleError("infisical universal-auth login failed: %s" % exc)
+        access = data.get("accessToken")
+        if not access:
+            raise AnsibleError("infisical login response missing accessToken")
+        _TOKEN_CACHE[key] = access
+        return access
+
+    def _fetch(self, url, access, project_id, env_slug, path, name):
+        qs = urllib.parse.urlencode(
+            {"workspaceId": project_id, "environment": env_slug, "secretPath": path}
+        )
+        endpoint = url + "/api/v3/secrets/raw/" + urllib.parse.quote(name, safe="") + "?" + qs
+        req = urllib.request.Request(
+            endpoint, headers={"Authorization": "Bearer " + access}, method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                data = json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            raise AnsibleError("infisical fetch '%s' failed (HTTP %s)" % (name, exc.code))
+        except Exception as exc:  # noqa: BLE001
+            raise AnsibleError("infisical fetch '%s' error: %s" % (name, exc))
+        try:
+            return data["secret"]["secretValue"]
+        except (KeyError, TypeError):
+            raise AnsibleError("infisical: unexpected response for '%s'" % name)
+'''
 
 
 def _git_ssh_hostname(url: str) -> str:
@@ -1898,12 +2501,38 @@ awx_ssl_mode: "{config.ssl_mode}"
 
 def gen_group_vars_all(config: Config) -> str:
     """Generate group_vars/all/main.yml."""
-    return f"""\
+    base = f"""\
 ---
 # Global group variables – generated by bootstrap_awx.py
 ansible_home: "{config.ansible_home}"
 admin_email: "{config.admin_email}"
 git_branch: "{config.git_branch}"
+"""
+    if not config.infisical_enabled:
+        return base
+
+    # Infisical connection for the `infisical` lookup. Non-secret values are baked
+    # in; the token / client secret come from the environment so they are never
+    # committed. When no credential is resolvable, infisical_available is false and
+    # roles fall back to local files (graceful degradation).
+    return base + f"""
+# --- Infisical secret backend ---------------------------------------------
+# Provide a credential at runtime to activate Infisical-backed secrets, e.g. an
+# AWX custom credential injecting INFISICAL_TOKEN (the bootstrap admin token from
+# secrets/infisical/admin_token), or INFISICAL_CLIENT_ID/INFISICAL_CLIENT_SECRET
+# for a Universal Auth machine identity. Without one, roles read local files.
+infisical_url: "{{{{ lookup('env', 'INFISICAL_URL') | default('https://{config.infisical_fqdn}', true) }}}}"
+infisical_project_id: "{{{{ lookup('env', 'INFISICAL_PROJECT_ID') | default('{config.infisical_project_id}', true) }}}}"
+infisical_env: "{{{{ lookup('env', 'INFISICAL_ENV') | default('{config.infisical_env_slug}', true) }}}}"
+infisical_token: "{{{{ lookup('env', 'INFISICAL_TOKEN') | default('', true) }}}}"
+infisical_client_id: "{{{{ lookup('env', 'INFISICAL_CLIENT_ID') | default('{config.infisical_client_id}', true) }}}}"
+infisical_client_secret: "{{{{ lookup('env', 'INFISICAL_CLIENT_SECRET') | default('', true) }}}}"
+infisical_available: >-
+  {{{{ (infisical_token | length > 0)
+     or (infisical_client_id | length > 0 and infisical_client_secret | length > 0) }}}}
+# AWX <-> Infisical user integration mode (none | autoinvite | idp). Consumed by
+# the awx_config role's user management when set to 'autoinvite'.
+infisical_user_sync: "{config.infisical_user_sync}"
 """
 
 
@@ -1928,8 +2557,11 @@ def gen_netbox_stub(config: Config) -> str:
     nb_url = config.netbox_url or "https://netbox.example.com"
     return f"""\
 ---
-# NetBox dynamic inventory – disabled by default.
-# Rename to netbox.yml and set NETBOX_TOKEN env var to enable.
+# NetBox dynamic inventory (netbox.netbox.nb_inventory).
+# The API token comes from the NETBOX_TOKEN env var — injected by the AWX
+# "NetBox API Token" credential on the inventory source, or exported from
+# secrets/netbox/token for host-local runs. When this file is named
+# netbox.yml.disabled it is inactive; rename to netbox.yml to enable.
 plugin: netbox.netbox.nb_inventory
 api_endpoint: {nb_url}
 token: "{{{{ lookup('env', 'NETBOX_TOKEN') }}}}"
@@ -2053,30 +2685,25 @@ galaxy_info:
     - ansible
     - automation
 
-dependencies:
-  - name: awx.awx
-    source: galaxy
+# No role dependencies. awx.awx is a COLLECTION (declared in
+# collections/requirements.yml and used via awx.awx.* FQCN modules), not a role.
+# Listing it under meta dependencies made Ansible resolve it as a role and fail
+# with "the role 'awx.awx' was not found".
+dependencies: []
 """
 
 
 def gen_role_handlers(config: Config) -> str:
-    """Generate role handlers/main.yml."""
-    home = config.ansible_home
-    return f"""\
+    """Generate role handlers/main.yml (intentionally empty)."""
+    return """\
 ---
 # handlers/main.yml for awx_config role
-- name: reload nginx
-  become: true
-  ansible.builtin.service:
-    name: nginx
-    state: reloaded
-
-- name: restart awx
-  community.docker.docker_compose_v2:
-    project_src: "{home}/compose/awx"
-    state: present
-    recreate: always
-  listen: restart_awx
+#
+# Intentionally empty. The previous "reload nginx" / "restart awx" handlers were
+# AWX *deployment* concerns - no task in this API-configuration role notified
+# them, and "restart awx" pulled in community.docker, which broke role loading
+# when that collection was absent from the execution environment. Deployment and
+# restart logic belongs in a separate deployment role/playbook, not here.
 """
 
 
@@ -2153,17 +2780,31 @@ def gen_role_tasks_auth(config: Config) -> str:
     """Generate role tasks/auth.yml – read .api_token file and set awx_api_token fact."""
     return """\
 ---
-# tasks/auth.yml – read API token and set bearer fact
-- name: Read AWX API token from file
-  ansible.builtin.slurp:
-    src: "{{ awx_token_file }}"
-  register: _token_raw
-  no_log: true
-
-- name: Set awx_api_token fact
+# tasks/auth.yml – obtain the AWX API token (Infisical first, file fallback)
+- name: Fetch AWX API token from Infisical
   ansible.builtin.set_fact:
-    awx_api_token: "{{ _token_raw.content | b64decode | trim }}"
+    awx_api_token: >-
+      {{ lookup('infisical', 'AWX_API_TOKEN',
+                url=infisical_url, project_id=infisical_project_id,
+                env_slug=infisical_env, token=infisical_token,
+                client_id=infisical_client_id, client_secret=infisical_client_secret,
+                default='') }}
   no_log: true
+  when: infisical_available | default(false) | bool
+
+- name: Read AWX API token from file (fallback when not in Infisical)
+  when: awx_api_token | default('') | length == 0
+  block:
+    - name: Slurp AWX API token file
+      ansible.builtin.slurp:
+        src: "{{ awx_token_file }}"
+      register: _token_raw
+      no_log: true
+
+    - name: Set awx_api_token fact from file
+      ansible.builtin.set_fact:
+        awx_api_token: "{{ _token_raw.content | b64decode | trim }}"
+      no_log: true
 
 - name: Verify token is valid via /api/v2/me/
   ansible.builtin.uri:
@@ -2203,11 +2844,31 @@ def gen_role_tasks_credentials(config: Config) -> str:
     return """\
 ---
 # tasks/credentials.yml – manage AWX credentials
-- name: Read deploy private key
-  ansible.builtin.slurp:
-    src: "{{ ansible_home }}/keys/deploy_key"
-  register: _deploy_key_raw
+# The deploy private key is read from Infisical when available, else the file.
+- name: Fetch deploy private key from Infisical
+  ansible.builtin.set_fact:
+    _deploy_key: >-
+      {{ lookup('infisical', 'AWX_DEPLOY_PRIVATE_KEY',
+                url=infisical_url, project_id=infisical_project_id,
+                env_slug=infisical_env, token=infisical_token,
+                client_id=infisical_client_id, client_secret=infisical_client_secret,
+                default='') }}
   no_log: true
+  when: infisical_available | default(false) | bool
+
+- name: Read deploy private key from file (fallback)
+  when: _deploy_key | default('') | length == 0
+  block:
+    - name: Slurp deploy private key
+      ansible.builtin.slurp:
+        src: "{{ ansible_home }}/keys/deploy_key"
+      register: _deploy_key_raw
+      no_log: true
+
+    - name: Set deploy key fact from file
+      ansible.builtin.set_fact:
+        _deploy_key: "{{ _deploy_key_raw.content | b64decode }}"
+      no_log: true
 
 - name: Ensure machine credential 'deploy_key' exists
   awx.awx.credential:
@@ -2216,7 +2877,7 @@ def gen_role_tasks_credentials(config: Config) -> str:
     credential_type: "Machine"
     state: present
     inputs:
-      ssh_key_data: "{{ _deploy_key_raw.content | b64decode }}"
+      ssh_key_data: "{{ _deploy_key }}"
     controller_host: "{{ awx_api_url }}"
     controller_oauthtoken: "{{ awx_api_token }}"
   no_log: true
@@ -2230,7 +2891,7 @@ def gen_role_tasks_credentials(config: Config) -> str:
     credential_type: "Source Control"
     state: present
     inputs:
-      ssh_key_data: "{{ _deploy_key_raw.content | b64decode }}"
+      ssh_key_data: "{{ _deploy_key }}"
     controller_host: "{{ awx_api_url }}"
     controller_oauthtoken: "{{ awx_api_token }}"
   no_log: true
@@ -2354,6 +3015,17 @@ def gen_role_tasks_netbox(config: Config) -> str:
     return """\
 ---
 # tasks/netbox.yml – NetBox integration (only when awx_netbox_url defined)
+- name: Fetch NetBox token from Infisical (overrides awx_netbox_token if present)
+  ansible.builtin.set_fact:
+    awx_netbox_token: >-
+      {{ lookup('infisical', 'NETBOX_TOKEN',
+                url=infisical_url, project_id=infisical_project_id,
+                env_slug=infisical_env, token=infisical_token,
+                client_id=infisical_client_id, client_secret=infisical_client_secret,
+                default=awx_netbox_token | default('')) }}
+  no_log: true
+  when: infisical_available | default(false) | bool
+
 - name: Verify NetBox is reachable
   ansible.builtin.uri:
     url: "{{ awx_netbox_url }}/api/"
@@ -2421,6 +3093,9 @@ def write_all_files(
     # Ansible cfg
     write_file("ansible.cfg", gen_ansible_cfg(config))
 
+    # Galaxy collections requirements (AWX-detected path: collections/requirements.yml)
+    write_file("collections/requirements.yml", gen_collections_requirements(config))
+
     # SSH client config – scopes deploy key to the git server host
     ssh_dir = h / ".ssh"
     if not ssh_dir.exists():
@@ -2442,7 +3117,12 @@ def write_all_files(
         "inventories/static/group_vars/awx_hosts/main.yml",
         gen_group_vars_awx(config),
     )
-    write_file("inventories/dynamic/netbox.yml.disabled", gen_netbox_stub(config))
+    # Enable the NetBox dynamic inventory (netbox.yml) when configured, so AWX's
+    # SCM inventory source can sync it; otherwise ship a disabled stub.
+    if config.netbox_url and config.netbox_token:
+        write_file("inventories/dynamic/netbox.yml", gen_netbox_stub(config))
+    else:
+        write_file("inventories/dynamic/netbox.yml.disabled", gen_netbox_stub(config))
 
     # Playbooks
     write_file("playbooks/site.yml", gen_playbook_site(config))
@@ -2468,6 +3148,13 @@ def write_all_files(
     # NGINX config
     nginx_conf = gen_nginx_config(config)
     write_file(f"nginx/{config.fqdn}.conf", nginx_conf)
+
+    # Infisical (compose + host nginx vhost). Its secret .env is written by
+    # generate_and_write_secrets().
+    if config.infisical_enabled:
+        write_file("compose/infisical/docker-compose.yml", gen_infisical_compose(config))
+        write_file(f"nginx/{config.infisical_fqdn}.conf", gen_infisical_nginx(config))
+        write_file("plugins/lookup/infisical.py", gen_infisical_lookup_plugin(config))
 
     log.info("All configuration files written.")
 
@@ -2917,6 +3604,16 @@ def _run_awx_migrations(config: "Config", timeout: int = 300) -> None:
     _exec(["awx-manage", "migrate"], "Running AWX database migrations", timeout)
     log.info("AWX migrations complete.")
 
+    # The AWX/Django user model has no single "display name" field; the web UI's
+    # First Name / Last Name map to first_name / last_name. Split the configured
+    # display name on the first whitespace: first word -> first_name, the rest ->
+    # last_name (truncated to the model's field limits, 30/150). A single-word
+    # name leaves last_name empty.
+    _admin_name = (config.awx_admin_name or "").strip()
+    _first_name, _, _last_name = _admin_name.partition(" ")
+    _first_name = _first_name[:30]
+    _last_name = _last_name.strip()[:150]
+
     # create_preload_data requires a superuser — create or update ours first.
     admin_script = (
         "from django.contrib.auth import get_user_model; "
@@ -2924,6 +3621,8 @@ def _run_awx_migrations(config: "Config", timeout: int = 300) -> None:
         f"u, _ = User.objects.get_or_create(username={config.awx_admin_login!r}); "
         "u.is_superuser = True; u.is_staff = True; "
         f"u.email = {config.awx_admin_email!r}; "
+        f"u.first_name = {_first_name!r}; "
+        f"u.last_name = {_last_name!r}; "
         f"u.set_password({config.awx_admin_password!r}); "
         "u.save()"
     )
@@ -3027,6 +3726,7 @@ def start_containers(
     state: State,
     home: str,
     config: "Config",
+    force_recreate: bool = False,
 ) -> None:
     """Ensure containers are up and healthy.
 
@@ -3051,8 +3751,11 @@ def start_containers(
     current_fp = _awx_settings_fingerprint(home)
     stored_fp = state.get("settings_fingerprint", "")
 
-    if was_started and current_fp == stored_fp:
+    if was_started and current_fp == stored_fp and not force_recreate:
         # Fast path: if containers are running and nothing changed, check DB only.
+        # Skipped when force_recreate is set (e.g. --force-pull rebuilt the AWX
+        # image): awx_settings.py is unchanged so the fingerprint matches, but the
+        # containers must still be recreated to pick up the new image.
         result = run(
             compose_cmd + ["-f", compose_file, "ps", "--status", "running"],
             cwd=cwd, capture=True, check=False,
@@ -3107,7 +3810,8 @@ def start_containers(
     # is kept for 'docker ps' status but not used as a blocking gate here
     # because AWX runs DB migrations on first boot, which can take minutes.
     log.info("Starting all containers ...")
-    run(compose_cmd + ["-f", compose_file, "up", "-d"], cwd=cwd)
+    _up_args = ["up", "-d"] + (["--force-recreate"] if force_recreate else [])
+    run(compose_cmd + ["-f", compose_file] + _up_args, cwd=cwd)
 
     # Phase 5: Run Django migrations.
     # launch_awx_web.sh starts supervisord directly without migrating, so
@@ -3296,6 +4000,67 @@ def awx_get_credential_type_id(
         f"Credential type '{name}' (kind={kind}) not found in AWX. "
         f"Available: {[r.get('name') for r in results]}"
     )
+
+
+def awx_ensure_org_galaxy_credential(base_url: str, token: str, org_id: int) -> None:
+    """Associate a Galaxy credential with the organization for content-sync.
+
+    AWX's create_preload_data seeds a managed "Ansible Galaxy" credential
+    (kind=galaxy, https://galaxy.ansible.com/), but it lives unattached in
+    Credentials. A freshly created organization has an EMPTY galaxy_credentials
+    list, and AWX only installs a project's collections/requirements.yml during
+    project sync when the project's organization has at least one Galaxy
+    credential attached. Without this, collections (e.g. netbox.netbox needed by
+    the dynamic inventory) never land in /runner/requirements_collections and
+    the netbox.netbox.nb_inventory plugin fails to load at inventory time.
+
+    Reuse the existing credential rather than creating a new one; this is
+    idempotent (skips when the org already has any Galaxy credential).
+    """
+    status, body = awx_api_call(
+        "GET", base_url,
+        f"/api/v2/organizations/{org_id}/galaxy_credentials/", token=token,
+    )
+    if status == 200 and isinstance(body, dict) and body.get("results"):
+        log.info("Organization %d already has a Galaxy credential; content-sync "
+                 "can install collections/requirements.yml.", org_id)
+        return
+
+    # Prefer the managed "Ansible Galaxy" credential; fall back to any galaxy one.
+    cred = awx_find_by_name(base_url, "/api/v2/credentials/", token, "Ansible Galaxy")
+    if not cred:
+        st, bd = awx_api_call(
+            "GET", base_url, "/api/v2/credentials/", token=token,
+            params={"credential_type__kind": "galaxy"},
+        )
+        results = bd.get("results", []) if (st == 200 and isinstance(bd, dict)) else []
+        cred = results[0] if results else None
+    if not cred:
+        log.warning(
+            "No Ansible Galaxy credential found in AWX; project content-sync will "
+            "NOT install collections/requirements.yml. Dynamic inventory needing "
+            "netbox.netbox will fail until a Galaxy credential is attached to the "
+            "organization or a custom execution environment is used."
+        )
+        return
+
+    cred_id = int(cred["id"])
+    st, bd = awx_api_call(
+        "POST", base_url,
+        f"/api/v2/organizations/{org_id}/galaxy_credentials/", token=token,
+        data={"id": cred_id},
+    )
+    if st in (200, 201, 204):
+        log.info(
+            "Associated Galaxy credential '%s' (id=%d) with organization %d so "
+            "content-sync installs collections/requirements.yml.",
+            cred.get("name"), cred_id, org_id,
+        )
+    else:
+        log.warning(
+            "Failed to associate Galaxy credential (id=%d) with organization %d "
+            "(HTTP %s): %s", cred_id, org_id, st, bd,
+        )
 
 
 def awx_project_has_playbook(
@@ -3802,6 +4567,16 @@ def _prepare_seed_source_from_local_scaffold(home: str, dest: Path) -> bool:
             shutil.copy2(src, dst)
         copied_any = True
 
+    # Copy only collections/requirements.yml — NOT the whole collections/ tree,
+    # which may hold the git-ignored vendored collections/ansible_collections/.
+    # AWX content-sync installs from this file during project sync (e.g.
+    # netbox.netbox for the dynamic inventory).
+    req_src = h / "collections" / "requirements.yml"
+    if req_src.exists():
+        (dest / "collections").mkdir(parents=True, exist_ok=True)
+        shutil.copy2(req_src, dest / "collections" / "requirements.yml")
+        copied_any = True
+
     # Ensure repository contains starter README files for discoverability.
     readmes = {
         dest / "README.md": (
@@ -3867,6 +4642,7 @@ def seed_blank_repo_from_current_awx(
     state: State,
     non_interactive: bool,
     assume_git_key_ready: bool,
+    force_reseed: bool = False,
 ) -> None:
     """Ensure target Git repo has required scaffold content.
 
@@ -3875,6 +4651,11 @@ def seed_blank_repo_from_current_awx(
     - If repo exists but misses required structure: prompt to populate (interactive)
       or auto-populate when explicitly allowed in non-interactive mode.
     - If repo already has required structure: do nothing.
+    - force_reseed (driven by --force-pull): re-push the installer-managed
+      scaffold files (ansible.cfg, collections/requirements.yml, README, and the
+      playbooks/roles/inventories trees) over the existing repo even when the
+      scaffold is already present — so installer fixes reach the project AWX
+      syncs from. Only the delta is committed; nothing is pushed if unchanged.
     """
     if not config.git_ssh_url:
         return
@@ -3929,7 +4710,7 @@ def seed_blank_repo_from_current_awx(
                 run(["git", "checkout", "-B", config.git_branch], cwd=str(target_worktree), check=True)
 
         missing_paths = [p for p in required_paths if not (target_worktree / p).exists()]
-        if not repo_is_blank and not missing_paths:
+        if not repo_is_blank and not missing_paths and not force_reseed:
             log.info(
                 "Target repository %s already contains required scaffold; no population needed.",
                 config.git_ssh_url,
@@ -3940,6 +4721,15 @@ def seed_blank_repo_from_current_awx(
         if repo_is_blank:
             should_populate = True
             log.info("Target repository %s is blank; preparing initial scaffold population.", config.git_ssh_url)
+        elif force_reseed:
+            should_populate = True
+            log.info(
+                "--force-pull: re-seeding installer-managed scaffold files into "
+                "existing repository %s (overwrites ansible.cfg, "
+                "collections/requirements.yml, README, and the playbooks/roles/"
+                "inventories trees; only the delta is committed).",
+                config.git_ssh_url,
+            )
         else:
             if non_interactive:
                 if not assume_git_key_ready:
@@ -4017,17 +4807,460 @@ def seed_blank_repo_from_current_awx(
     log.info("Repository scaffold population completed for %s on branch %s.", config.git_ssh_url, config.git_branch)
 
 
+def _awx_token(home: str) -> Optional[str]:
+    """Read the AWX API token written during awx_bootstrap, or None."""
+    try:
+        return read_secret_file(Path(home) / "secrets" / ".api_token")
+    except OSError:
+        return None
+
+
+def provision_awx_ldap(config: Config, home: str, state: State) -> None:
+    """Configure AWX LDAP/AD authentication via PATCH /api/v2/settings/ldap/.
+
+    Idempotent (settings are overwritten with the configured values). Non-fatal
+    on error so an LDAP misconfig doesn't abort the install."""
+    if not config.ldap_enabled:
+        return
+    if not config.ldap_server_uri or not config.ldap_user_search_base:
+        log.warning("LDAP not fully specified (server URI / user search base); skipping AWX LDAP.")
+        return
+    token = _awx_token(home)
+    if not token:
+        log.warning("AWX LDAP: API token unavailable; skipping.")
+        return
+    base_url = f"http://127.0.0.1:{config.awx_listen_port}"
+    settings = {
+        "AUTH_LDAP_SERVER_URI": config.ldap_server_uri,
+        "AUTH_LDAP_BIND_DN": config.ldap_bind_dn,
+        "AUTH_LDAP_BIND_PASSWORD": config.ldap_bind_password,
+        "AUTH_LDAP_START_TLS": bool(config.ldap_start_tls),
+        "AUTH_LDAP_USER_SEARCH": [
+            config.ldap_user_search_base, "SCOPE_SUBTREE", config.ldap_user_search_filter,
+        ],
+        "AUTH_LDAP_USER_DN_TEMPLATE": None,
+        "AUTH_LDAP_USER_ATTR_MAP": {
+            "first_name": config.ldap_first_name_attr,
+            "last_name": config.ldap_last_name_attr,
+            "email": config.ldap_email_attr,
+        },
+    }
+    if config.ldap_group_search_base:
+        settings["AUTH_LDAP_GROUP_SEARCH"] = [
+            config.ldap_group_search_base, "SCOPE_SUBTREE", "(objectClass=group)",
+        ]
+        settings["AUTH_LDAP_GROUP_TYPE"] = "MemberDNGroupType"
+        settings["AUTH_LDAP_GROUP_TYPE_PARAMS"] = {"name_attr": "cn", "member_attr": "member"}
+    log.info("Configuring AWX LDAP authentication (%s) ...", config.ldap_server_uri)
+    try:
+        status, body = awx_api_call("PATCH", base_url, "/api/v2/settings/ldap/", token=token, data=settings)
+        if status not in (200, 201):
+            log.warning("AWX LDAP settings PATCH returned HTTP %s: %s", status, body)
+        else:
+            log.info("AWX LDAP authentication configured.")
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning("AWX LDAP configuration failed (non-fatal): %s", exc)
+
+
+def provision_infisical_ldap(config: Config, home: str, state: State) -> None:
+    """Best-effort Infisical LDAP config via its API. Infisical LDAP is an
+    Enterprise (paid, LICENSE_KEY) feature and its API is not publicly stable, so
+    this is non-fatal and prints manual-setup guidance on failure."""
+    if config.infisical_user_sync != "idp" or config.idp_type != "ldap":
+        return
+    if not config.infisical_enabled:
+        return
+    token = state.get("infisical_admin_token")
+    org_id = state.get("infisical_org_id")
+    if not token or not org_id:
+        log.warning("Infisical LDAP: no admin token/org from seeding; configure LDAP manually.")
+        return
+    base_url = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+    payload = {
+        "organizationId": org_id,
+        "isActive": True,
+        "url": config.ldap_server_uri,
+        "bindDN": config.ldap_bind_dn,
+        "bindPass": config.ldap_bind_password,
+        "searchBase": config.ldap_user_search_base,
+        "searchFilter": config.ldap_user_search_filter.replace("%(user)s", "{{username}}"),
+        "groupSearchBase": config.ldap_group_search_base,
+    }
+    log.info("Attempting Infisical LDAP configuration (Enterprise feature) ...")
+    try:
+        status, body = awx_api_call("POST", base_url, "/api/v1/ldap/config", token=token, data=payload)
+        if status in (200, 201):
+            log.info("Infisical LDAP configured.")
+            return
+        log.warning(
+            "Infisical LDAP config returned HTTP %s: %s. Infisical LDAP requires an "
+            "Enterprise license (LICENSE_KEY) and may need manual setup via the "
+            "Infisical UI (Organization Settings -> Security -> SSO -> LDAP).", status, body,
+        )
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning(
+            "Infisical LDAP configuration failed (non-fatal): %s. Configure it manually "
+            "in the Infisical UI (requires an Enterprise license).", exc,
+        )
+
+
+def infisical_invite_awx_users(config: Config, home: str, state: State) -> None:
+    """autoinvite: invite existing AWX users into the seeded Infisical project so
+    they get an Infisical account. Non-fatal; passwords are NOT synced (Infisical
+    uses SRP) — invited users complete signup themselves."""
+    if config.infisical_user_sync != "autoinvite" or not config.infisical_enabled:
+        return
+    inf_token = state.get("infisical_admin_token")
+    project_id = state.get("infisical_project_id")
+    awx_tok = _awx_token(home)
+    if not (inf_token and project_id and awx_tok):
+        log.warning("autoinvite: missing Infisical admin token / project / AWX token; skipping.")
+        return
+    awx_base = f"http://127.0.0.1:{config.awx_listen_port}"
+    inf_base = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+    try:
+        status, body = awx_api_call("GET", awx_base, "/api/v2/users/", token=awx_tok,
+                                    params={"page_size": "200"})
+        users = body.get("results", []) if isinstance(body, dict) else []
+        emails = sorted({
+            u.get("email") for u in users
+            if u.get("email") and not u.get("is_system_auditor", False)
+        })
+        if not emails:
+            log.info("autoinvite: no AWX user emails to invite.")
+            return
+        log.info("autoinvite: inviting %d AWX user(s) into Infisical project ...", len(emails))
+        st, bd = awx_api_call(
+            "POST", inf_base, f"/api/v1/projects/{project_id}/memberships",
+            token=inf_token, data={"emails": emails, "roleSlugs": ["member"]},
+        )
+        if st not in (200, 201):
+            log.warning("autoinvite: Infisical invite returned HTTP %s: %s", st, bd)
+        else:
+            log.info("autoinvite: invited %d user(s) into Infisical.", len(emails))
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning("autoinvite failed (non-fatal): %s", exc)
+
+
+def provision_job_templates_from_playbooks(config: Config, home: str, state: State) -> None:
+    """Create a basic AWX job template for each playbook in the synced SCM project
+    that does not already have one. The default inventory and machine + Infisical
+    credentials are pre-attached (inventory can be overridden on launch).
+    Idempotent (find-by-name); non-fatal."""
+    project_id = state.get("awx_project_id")
+    if not project_id:
+        log.info("No SCM project (no git URL) — skipping job-template reconciliation.")
+        return
+    token = _awx_token(home)
+    if not token:
+        log.warning("Job templates: AWX API token unavailable; skipping.")
+        return
+    base_url = f"http://127.0.0.1:{config.awx_listen_port}"
+    inventory_id = state.get("awx_inventory_id")
+    machine_cred_id = state.get("awx_machine_cred_id")
+    infisical_cred_id = state.get("infisical_awx_cred_id")
+
+    # The playbooks list is only populated after the project sync completes;
+    # poll briefly.
+    playbooks: list = []
+    for _ in range(20):
+        try:
+            status, body = awx_api_call(
+                "GET", base_url, f"/api/v2/projects/{project_id}/playbooks/", token=token)
+        except Exception:  # noqa: BLE001
+            status, body = 0, None
+        if status == 200 and isinstance(body, list) and body:
+            playbooks = body
+            break
+        time.sleep(6)
+    if not playbooks:
+        log.warning("Job templates: project has no playbooks listed yet (sync pending?); skipping.")
+        return
+
+    created = 0
+    for pb in playbooks:
+        base = pb.rsplit("/", 1)[-1]
+        for ext in (".yml", ".yaml"):
+            if base.endswith(ext):
+                base = base[: -len(ext)]
+                break
+        jt_name = f"Playbook: {base}"
+        try:
+            existing = awx_find_by_name(base_url, "/api/v2/job_templates/", token, jt_name)
+            if existing:
+                jt_id = int(existing["id"])
+            else:
+                data = {
+                    "name": jt_name,
+                    "job_type": "run",
+                    "project": project_id,
+                    "playbook": pb,
+                    "ask_inventory_on_launch": True,
+                }
+                if inventory_id:
+                    data["inventory"] = inventory_id
+                status, body = awx_api_call(
+                    "POST", base_url, "/api/v2/job_templates/", token=token, data=data)
+                if status not in (200, 201):
+                    log.warning("Job template '%s' create HTTP %s: %s", jt_name, status, body)
+                    continue
+                jt_id = int(body["id"])
+                created += 1
+            for cid in (machine_cred_id, infisical_cred_id):
+                if cid:
+                    awx_api_call("POST", base_url, f"/api/v2/job_templates/{jt_id}/credentials/",
+                                 token=token, data={"id": cid})
+        except Exception as exc:  # noqa: BLE001 — non-fatal, continue with the rest
+            log.warning("Job template for '%s' failed (non-fatal): %s", pb, exc)
+    log.info("Job templates reconciled from project playbooks (%d created, %d total).",
+             created, len(playbooks))
+
+
+def ensure_infisical_project(config: Config, home: str, state: State) -> None:
+    """When an existing Universal Auth identity is supplied (so seed_infisical was
+    skipped), ensure the configured Infisical project exists so the lookup matches.
+    Best-effort: logs in with the client creds, creates the project (default envs),
+    and records its id. Non-fatal — if the project already exists or creation is
+    denied, logs guidance to set infisical_project_id manually."""
+    if not (config.infisical_enabled and config.infisical_client_id and config.infisical_client_secret):
+        return
+    if config.infisical_project_id or state.get("infisical_project_id"):
+        return  # already known (e.g. from seeding)
+    base_url = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+    try:
+        st, body = awx_api_call(
+            "POST", base_url, "/api/v1/auth/universal-auth/login",
+            data={"clientId": config.infisical_client_id,
+                  "clientSecret": config.infisical_client_secret},
+        )
+        if st not in (200, 201) or not isinstance(body, dict) or not body.get("accessToken"):
+            log.warning("Infisical project ensure: login failed (HTTP %s); set "
+                        "infisical_project_id manually to match the lookup.", st)
+            return
+        access = body["accessToken"]
+        st, body = awx_api_call(
+            "POST", base_url, "/api/v2/workspace", token=access,
+            data={"projectName": config.infisical_project_name,
+                  "type": "secret-manager", "shouldCreateDefaultEnvs": True},
+        )
+        if st in (200, 201):
+            project = body.get("project") or body.get("workspace") or body
+            pid = project.get("id") or project.get("_id", "")
+            config.infisical_project_id = pid
+            state.set("infisical_project_id", pid)
+            log.info("Infisical project '%s' ensured (id=%s).", config.infisical_project_name, pid)
+        else:
+            log.warning(
+                "Infisical project ensure returned HTTP %s: %s. If the project "
+                "already exists, set infisical_project_id (or the INFISICAL_PROJECT_ID "
+                "env) so the lookup matches.", st, body,
+            )
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning("Infisical project ensure failed (non-fatal): %s", exc)
+
+
+def provision_infisical_awx_credential(config: Config, home: str, state: State) -> None:
+    """Create an AWX 'Infisical' custom credential type + credential that injects
+    the Infisical connection into job environments (INFISICAL_URL/TOKEN or
+    CLIENT_ID/SECRET, plus PROJECT_ID and ENV), and attach it to the awx_config
+    job template — so the lookup uses the seeded project automatically. Non-fatal."""
+    if not config.infisical_enabled:
+        return
+    awx_tok = _awx_token(home)
+    if not awx_tok:
+        log.warning("Infisical AWX credential: AWX API token unavailable; skipping.")
+        return
+    base_url = f"http://127.0.0.1:{config.awx_listen_port}"
+    org_id = state.get("awx_org_id")
+    scheme = "http" if config.ssl_mode == "none" else "https"
+    inputs = {
+        "infisical_url": f"{scheme}://{config.infisical_fqdn}",
+        "infisical_token": state.get("infisical_admin_token") or "",
+        "infisical_client_id": config.infisical_client_id,
+        "infisical_client_secret": config.infisical_client_secret,
+        "infisical_project_id": config.infisical_project_id or state.get("infisical_project_id") or "",
+        "infisical_env": config.infisical_env_slug,
+    }
+    try:
+        ct_name = "Infisical"
+        ct = awx_find_by_name(base_url, "/api/v2/credential_types/", awx_tok, ct_name)
+        if ct:
+            ct_id = int(ct["id"])
+        else:
+            st, body = awx_api_call("POST", base_url, "/api/v2/credential_types/", token=awx_tok, data={
+                "name": ct_name, "kind": "cloud",
+                "inputs": {"fields": [
+                    {"id": "infisical_url", "label": "Infisical URL", "type": "string"},
+                    {"id": "infisical_token", "label": "Token Auth JWT", "type": "string", "secret": True},
+                    {"id": "infisical_client_id", "label": "Universal Auth Client ID", "type": "string"},
+                    {"id": "infisical_client_secret", "label": "Universal Auth Client Secret", "type": "string", "secret": True},
+                    {"id": "infisical_project_id", "label": "Project ID", "type": "string"},
+                    {"id": "infisical_env", "label": "Environment slug", "type": "string"},
+                ]},
+                "injectors": {"env": {
+                    "INFISICAL_URL": "{{ infisical_url }}",
+                    "INFISICAL_TOKEN": "{{ infisical_token }}",
+                    "INFISICAL_CLIENT_ID": "{{ infisical_client_id }}",
+                    "INFISICAL_CLIENT_SECRET": "{{ infisical_client_secret }}",
+                    "INFISICAL_PROJECT_ID": "{{ infisical_project_id }}",
+                    "INFISICAL_ENV": "{{ infisical_env }}",
+                }},
+            })
+            if st not in (200, 201):
+                log.warning("Infisical credential type create HTTP %s: %s", st, body)
+                return
+            ct_id = int(body["id"])
+
+        cred_name = "Infisical"
+        cred = awx_find_by_name(base_url, "/api/v2/credentials/", awx_tok, cred_name)
+        if cred:
+            cred_id = int(cred["id"])
+            awx_api_call("PATCH", base_url, f"/api/v2/credentials/{cred_id}/",
+                         token=awx_tok, data={"inputs": inputs})
+        else:
+            st, body = awx_api_call("POST", base_url, "/api/v2/credentials/", token=awx_tok, data={
+                "name": cred_name, "organization": org_id, "credential_type": ct_id, "inputs": inputs,
+            })
+            if st not in (200, 201):
+                log.warning("Infisical credential create HTTP %s: %s", st, body)
+                return
+            cred_id = int(body["id"])
+
+        state.set("infisical_awx_cred_id", cred_id)
+        jt_id = state.get("awx_job_template_id")
+        if jt_id:
+            awx_api_call("POST", base_url, f"/api/v2/job_templates/{jt_id}/credentials/",
+                         token=awx_tok, data={"id": cred_id})
+            log.info("Attached Infisical credential to job template id=%s.", jt_id)
+        log.info("AWX Infisical credential provisioned (project id=%s).",
+                 inputs["infisical_project_id"] or "(unset)")
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning("AWX Infisical credential provisioning failed (non-fatal): %s", exc)
+
+
+def provision_netbox_inventory(
+    config: Config, home: str, state: State, force: bool = False
+) -> None:
+    """Provision a working NetBox dynamic inventory in AWX during bootstrap:
+    a custom credential type that injects NETBOX_TOKEN, a credential holding the
+    token, a 'NetBox' inventory, and an SCM inventory source pointing at the
+    project's inventories/dynamic/netbox.yml. Idempotent; non-fatal on error so a
+    NetBox hiccup never aborts the install.
+
+    force (driven by --force-pull): re-run even if already provisioned, so the
+    inventory-source update is re-kicked after a forced project sync."""
+    if not (config.netbox_url and config.netbox_token):
+        return
+    if state.is_complete("netbox_inventory") and not force:
+        log.info("NetBox dynamic inventory already provisioned (state checkpoint).")
+        return
+    project_id = state.get("awx_project_id")
+    if not project_id:
+        log.warning(
+            "NetBox dynamic inventory needs the AWX SCM project (set a git URL); skipping."
+        )
+        return
+
+    base_url = f"http://127.0.0.1:{config.awx_listen_port}"
+    org_id = state.get("awx_org_id")
+    try:
+        token = read_secret_file(Path(home) / "secrets" / ".api_token")
+    except OSError as exc:
+        log.warning("NetBox inventory: cannot read AWX API token (%s); skipping.", exc)
+        return
+
+    def _post(path: str, data: dict) -> dict:
+        status, body = awx_api_call("POST", base_url, path, token=token, data=data)
+        if status not in (200, 201):
+            raise RuntimeError(f"POST {path} -> HTTP {status}: {body}")
+        return body
+
+    try:
+        # 1) Custom credential type that injects NETBOX_TOKEN / NETBOX_API_KEY.
+        ct_name = "NetBox API Token"
+        ct = awx_find_by_name(base_url, "/api/v2/credential_types/", token, ct_name)
+        ct_id = int(ct["id"]) if ct else int(_post("/api/v2/credential_types/", {
+            "name": ct_name,
+            "kind": "cloud",
+            "inputs": {
+                "fields": [{"id": "netbox_token", "label": "NetBox API Token",
+                            "type": "string", "secret": True}],
+                "required": ["netbox_token"],
+            },
+            "injectors": {"env": {
+                "NETBOX_TOKEN": "{{ netbox_token }}",
+                "NETBOX_API_KEY": "{{ netbox_token }}",
+            }},
+        })["id"])
+
+        # 2) Credential holding the token (update inputs if it already exists).
+        cred_name = "NetBox API Token"
+        cred = awx_find_by_name(base_url, "/api/v2/credentials/", token, cred_name)
+        if cred:
+            cred_id = int(cred["id"])
+            awx_api_call("PATCH", base_url, f"/api/v2/credentials/{cred_id}/", token=token,
+                         data={"inputs": {"netbox_token": config.netbox_token}})
+        else:
+            cred_id = int(_post("/api/v2/credentials/", {
+                "name": cred_name, "organization": org_id, "credential_type": ct_id,
+                "inputs": {"netbox_token": config.netbox_token},
+            })["id"])
+
+        # 3) NetBox inventory.
+        inv_name = "NetBox"
+        inv = awx_find_by_name(base_url, "/api/v2/inventories/", token, inv_name)
+        inv_id = int(inv["id"]) if inv else int(_post("/api/v2/inventories/", {
+            "name": inv_name, "organization": org_id,
+        })["id"])
+
+        # 4) SCM inventory source pointing at the project's netbox.yml.
+        src_name = "NetBox Dynamic"
+        src = awx_find_by_name(base_url, "/api/v2/inventory_sources/", token, src_name,
+                               params={"inventory": str(inv_id)})
+        src_data = {
+            "name": src_name, "inventory": inv_id, "source": "scm",
+            "source_project": project_id,
+            "source_path": "inventories/dynamic/netbox.yml",
+            "credential": cred_id,
+            "overwrite": True, "overwrite_vars": True, "update_on_launch": True,
+        }
+        if src:
+            src_id = int(src["id"])
+            awx_api_call("PATCH", base_url, f"/api/v2/inventory_sources/{src_id}/",
+                         token=token, data=src_data)
+        else:
+            src_id = int(_post("/api/v2/inventory_sources/", src_data)["id"])
+
+        # 5) Kick off an initial sync (non-fatal if the project hasn't synced yet).
+        awx_api_call("POST", base_url, f"/api/v2/inventory_sources/{src_id}/update/", token=token)
+        state.complete("netbox_inventory")
+        log.info("NetBox dynamic inventory provisioned (inventory id=%d, source id=%d).",
+                 inv_id, src_id)
+    except Exception as exc:  # noqa: BLE001 — non-fatal
+        log.warning("NetBox dynamic inventory provisioning failed (non-fatal): %s", exc)
+
+
 def awx_bootstrap(
     config: Config,
     home: str,
     state: State,
     non_interactive: bool = False,
     assume_git_key_ready: bool = False,
+    force_sync: bool = False,
 ) -> None:
-    """Full AWX bootstrap sequence via REST API v2."""
-    if state.is_complete("awx_bootstrap"):
+    """Full AWX bootstrap sequence via REST API v2.
+
+    force_sync (driven by --force-pull): re-run the idempotent bootstrap even if
+    already completed, and force a project content-sync so freshly reseeded repo
+    content (ansible.cfg / collections/requirements.yml) is checked out instead
+    of relying on AWX's last synced revision.
+    """
+    if state.is_complete("awx_bootstrap") and not force_sync:
         log.info("AWX already bootstrapped (state checkpoint). Skipping.")
         return
+    if state.is_complete("awx_bootstrap") and force_sync:
+        log.info("AWX already bootstrapped; --force-pull set, re-running to force "
+                 "a project sync.")
 
     secrets_dir = Path(home) / "secrets"
     base_url = f"http://127.0.0.1:{config.awx_listen_port}"
@@ -4071,6 +5304,11 @@ def awx_bootstrap(
         org_id = int(body["id"])
         log.info("Organization '%s' created (id=%d).", org_name, org_id)
     state.set("awx_org_id", org_id)
+
+    # Attach a Galaxy credential to the org so project content-sync installs
+    # collections/requirements.yml (e.g. netbox.netbox for the dynamic inventory)
+    # into /runner/requirements_collections. Done before the project sync below.
+    awx_ensure_org_galaxy_credential(base_url, token, org_id)
 
     # Step 4: GET credential type IDs
     log.info("Fetching AWX credential type IDs ...")
@@ -4183,11 +5421,14 @@ def awx_bootstrap(
                         f"Failed to update project '{project_name}': HTTP {status}: {body}"
                     )
 
-            if not awx_project_has_playbook(base_url, token, project_id, expected_playbook):
+            if force_sync or not awx_project_has_playbook(
+                base_url, token, project_id, expected_playbook
+            ):
                 log.info(
-                    "Project '%s' is missing playbook '%s'; triggering project sync ...",
+                    "Triggering project sync for '%s' (%s) ...",
                     project_name,
-                    expected_playbook,
+                    "forced by --force-pull" if force_sync
+                    else f"missing playbook '{expected_playbook}'",
                 )
                 awx_sync_project_with_recovery(
                     base_url,
@@ -4421,10 +5662,15 @@ def write_nginx_config(
     config: Config,
     home: str,
     platform_adapter: PlatformAdapter,
+    conf_name: Optional[str] = None,
 ) -> str:
-    """Write NGINX config, create symlinks, return canonical config path."""
+    """Write NGINX config, create symlinks, return canonical config path.
+
+    conf_name defaults to "<fqdn>.conf" (the AWX vhost); pass another (e.g.
+    "<infisical_fqdn>.conf") to deploy an additional vhost the same way.
+    """
     nginx_dir = Path(home) / "nginx"
-    conf_name = f"{config.fqdn}.conf"
+    conf_name = conf_name or f"{config.fqdn}.conf"
     canonical_path = nginx_dir / conf_name
 
     conf_dir = platform_adapter.nginx_conf_dir()
@@ -4550,15 +5796,17 @@ def run_certbot(
     config: Config,
     home: str,
     credentials_path: Optional[str] = None,
+    domain: Optional[str] = None,
 ) -> None:
-    """Run certbot to obtain a certificate."""
+    """Run certbot to obtain a certificate. `domain` defaults to the AWX FQDN."""
+    domain = domain or config.fqdn
     cmd: List[str] = [
         "certbot",
         "certonly",
         "--non-interactive",
         "--agree-tos",
         "--email", config.certbot_email,
-        "--domains", config.fqdn,
+        "--domains", domain,
     ]
 
     if config.ssl_mode == "certbot_http":
@@ -4626,6 +5874,308 @@ ExecStart=/usr/bin/certbot renew --quiet --post-hook "systemctl reload nginx"
             if not cron_path.exists():
                 cron_path.write_text(cron_line)
                 log.info("Certbot renewal cron job written to %s", cron_path)
+
+
+def run_acme_sh(config: Config, home: str, domain: Optional[str] = None) -> None:
+    """Obtain and install a certificate using a pre-existing acme.sh (HTTP-01).
+
+    acme.sh is expected to be already installed and configured (its own cron
+    handles future renewals, and the reloadcmd persisted by --install-cert
+    reloads nginx after each renewal). We only issue the cert via HTTP-01 in
+    --nginx mode and install it to a stable path nginx serves. `domain` defaults
+    to the AWX FQDN; pass another domain (e.g. the Infisical FQDN) to reuse this.
+    """
+    domain = domain or config.fqdn
+    acme_bin = str(Path(config.acme_sh_basedir) / "acme.sh")
+    if not Path(acme_bin).exists():
+        raise SystemExit(
+            f"acme.sh not found at {acme_bin}. Install/configure acme.sh first, "
+            f"or correct the acme.sh base directory."
+        )
+
+    ssl_dir = Path(f"/etc/nginx/ssl/{domain}")
+    ssl_dir.mkdir(parents=True, exist_ok=True)
+    ssl_dir.chmod(0o700)
+
+    # Register the ACME account if an email was given (idempotent; tolerate
+    # "already registered").
+    if config.certbot_email:
+        run_ok([acme_bin, "--register-account", "-m", config.certbot_email])
+
+    # Issue via HTTP-01 in nginx mode. rc 0 = issued, rc 2 = cert already valid.
+    log.info("Running acme.sh to obtain certificate for %s ...", domain)
+    issue = run([acme_bin, "--issue", "--nginx", "-d", domain], check=False)
+    if issue.returncode not in (0, 2):
+        raise subprocess.CalledProcessError(issue.returncode, f"{acme_bin} --issue")
+
+    # Install cert/key to the stable nginx path, with a reload hook for renewals.
+    run([
+        acme_bin, "--install-cert", "-d", domain,
+        "--key-file", str(ssl_dir / "key.pem"),
+        "--fullchain-file", str(ssl_dir / "fullchain.pem"),
+        "--reloadcmd", "systemctl reload nginx",
+    ])
+    log.info("acme.sh certificate issued/installed for %s.", domain)
+
+
+def provision_infisical_db(
+    config: Config,
+    home: str,
+    compose_cmd: List[str],
+    infisical_db_password: str,
+) -> None:
+    """Create the infisical role + database on AWX's PostgreSQL (idempotent).
+
+    Runs psql inside AWX's postgres container via `docker compose exec`, as AWX's
+    superuser over the local socket — no port exposure or TCP password needed.
+    The password is token_hex, so it is safe inside SQL single quotes.
+    """
+    awx_compose = str(Path(home) / "compose" / "awx" / "docker-compose.yml")
+    user = config.infisical_db_user
+    dbname = config.infisical_db_name
+    pw = infisical_db_password
+
+    def _psql(sql: str, check: bool = True) -> subprocess.CompletedProcess:
+        return run(
+            compose_cmd + [
+                "-f", awx_compose, "exec", "-T", "postgres",
+                "psql", "-U", config.db_user, "-d", "postgres",
+                "-v", "ON_ERROR_STOP=1", "-c", sql,
+            ],
+            cwd=str(Path(awx_compose).parent),
+            capture=True,
+            check=check,
+        )
+
+    log.info("Provisioning Infisical role/database on AWX PostgreSQL ...")
+    _psql(
+        f"DO $$ BEGIN "
+        f"IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='{user}') THEN "
+        f"CREATE ROLE {user} LOGIN PASSWORD '{pw}'; "
+        f"ELSE ALTER ROLE {user} WITH LOGIN PASSWORD '{pw}'; END IF; END $$;"
+    )
+    # CREATE DATABASE cannot be conditional inside a transaction; tolerate "exists".
+    res = _psql(f"CREATE DATABASE {dbname} OWNER {user};", check=False)
+    if res.returncode != 0 and "already exists" not in (res.stderr or ""):
+        raise RuntimeError(f"Failed to create Infisical database: {res.stderr}")
+    _psql(f"GRANT ALL PRIVILEGES ON DATABASE {dbname} TO {user};")
+    log.info("Infisical database '%s' / role '%s' ready.", dbname, user)
+
+
+def deploy_infisical(
+    config: Config,
+    home: str,
+    compose_cmd: List[str],
+    platform_adapter: PlatformAdapter,
+    state: State,
+) -> None:
+    """Provision Infisical's DB on AWX's PostgreSQL, obtain its TLS cert, deploy
+    its nginx vhost, and bring up its compose stack. Requires AWX (postgres) up."""
+    if not config.infisical_enabled:
+        return
+    log.info("── Deploying Infisical (%s) ──", config.infisical_fqdn)
+    conf_name = f"{config.infisical_fqdn}.conf"
+    nginx_dir = Path(home) / "nginx"
+
+    # 1) Provision the infisical role/db on AWX's shared PostgreSQL. The password
+    #    was generated and persisted to state during the Secrets phase.
+    if not state.is_complete("infisical_db"):
+        provision_infisical_db(
+            config, home, compose_cmd, state.get("infisical_db_password") or "",
+        )
+        state.complete("infisical_db")
+
+    # 2) Obtain the certificate for the infisical FQDN. HTTP-01 (acme.sh /
+    #    certbot_http) needs nginx serving the infisical vhost on HTTP first.
+    if config.ssl_mode in ("certbot_http", "certbot_dns", "acme_sh") \
+            and not state.is_complete("infisical_cert"):
+        if config.ssl_mode in ("certbot_http", "acme_sh"):
+            tmp_mode = config.ssl_mode
+            config.ssl_mode = "none"
+            (nginx_dir / conf_name).write_text(gen_infisical_nginx(config))
+            config.ssl_mode = tmp_mode
+            write_nginx_config(config, home, platform_adapter, conf_name=conf_name)
+            validate_reload_nginx()
+        if config.ssl_mode == "acme_sh":
+            run_acme_sh(config, home, domain=config.infisical_fqdn)
+        else:
+            run_certbot(
+                config, home, state.get("certbot_credentials_path"),
+                domain=config.infisical_fqdn,
+            )
+        state.complete("infisical_cert")
+
+    # 3) Deploy the final infisical vhost (HTTPS when configured) and reload.
+    (nginx_dir / conf_name).write_text(gen_infisical_nginx(config))
+    write_nginx_config(config, home, platform_adapter, conf_name=conf_name)
+    validate_reload_nginx()
+
+    # 4) Bring up the infisical compose stack (its .env lives beside the compose).
+    inf_compose = str(Path(home) / "compose" / "infisical" / "docker-compose.yml")
+    inf_dir = str(Path(inf_compose).parent)
+    run(compose_cmd + ["-f", inf_compose, "pull"], cwd=inf_dir, check=False)
+    run(compose_cmd + ["-f", inf_compose, "up", "-d"], cwd=inf_dir)
+    log.info("Infisical deployed: https://%s", config.infisical_fqdn)
+
+
+def seed_infisical(config: Config, home: str, state: State, uid: int, gid: int) -> None:
+    """Seed a fresh Infisical instance via its API: bootstrap the admin user +
+    organization (+ an instance-admin Token-Auth identity), then create a project
+    with default environments (dev/staging/prod) to hold migrated secrets.
+
+    Idempotent via state checkpoints. The bootstrap token is only returned once,
+    so it is persisted to state + a secret file. If the user supplied an existing
+    Machine Identity (infisical_client_id), seeding is skipped.
+    """
+    if not config.infisical_enabled:
+        return
+    if config.infisical_client_id:
+        log.info("Infisical: existing Machine Identity supplied – skipping seeding.")
+        return
+    if state.is_complete("infisical_seed"):
+        log.info("Infisical already seeded (state checkpoint).")
+        return
+
+    base_url = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+
+    # Wait for the Infisical API to come up (it migrates its DB on first start).
+    log.info("Waiting for Infisical API at %s ...", base_url)
+    ready = False
+    for _ in range(60):
+        try:
+            status, _ = awx_api_call("GET", base_url, "/api/status")
+            if status == 200:
+                ready = True
+                break
+        except Exception:  # noqa: BLE001 — keep polling until timeout
+            pass
+        time.sleep(5)
+    if not ready:
+        raise SystemExit("Infisical API did not become ready in time; cannot seed.")
+
+    admin_password = state.get("infisical_admin_password")
+    admin_email = config.awx_admin_email or config.admin_email
+
+    # 1) Instance bootstrap → admin user, organization, admin Token-Auth identity.
+    log.info("Bootstrapping Infisical instance (admin user + organization) ...")
+    status, body = awx_api_call(
+        "POST", base_url, "/api/v1/admin/bootstrap",
+        data={
+            "email": admin_email,
+            "password": admin_password,
+            "organization": config.awx_organization_name,
+        },
+    )
+    if status not in (200, 201):
+        raise SystemExit(
+            f"Infisical bootstrap failed (HTTP {status}): {body}. If the instance "
+            f"was already provisioned the one-time admin token cannot be recovered; "
+            f"supply an existing Machine Identity (infisical_client_id) instead."
+        )
+    admin_token = body["identity"]["credentials"]["token"]
+    org = body.get("organization", {})
+    state.set("infisical_admin_token", admin_token)
+    state.set("infisical_org_id", org.get("id", ""))
+    state.set("infisical_org_slug", org.get("slug", ""))
+    write_secret_file(
+        Path(home) / "secrets" / "infisical" / "admin_token", admin_token + "\n", uid, gid
+    )
+    log.info("Infisical bootstrapped: organization '%s'.", config.awx_organization_name)
+
+    # 2) Create a project with default environments (dev/staging/prod) for secrets.
+    log.info("Creating Infisical project '%s' ...", config.infisical_project_name)
+    status, body = awx_api_call(
+        "POST", base_url, "/api/v2/workspace",
+        token=admin_token,
+        data={
+            "projectName": config.infisical_project_name,
+            "type": "secret-manager",
+            "shouldCreateDefaultEnvs": True,
+        },
+    )
+    if status not in (200, 201):
+        raise SystemExit(f"Infisical project creation failed (HTTP {status}): {body}")
+    project = body.get("project") or body.get("workspace") or body
+    project_id = project.get("id") or project.get("_id", "")
+    state.set("infisical_project_id", project_id)
+    state.set("infisical_project_slug", project.get("slug", ""))
+    # Make the project id available for baking into group_vars (non-secret).
+    config.infisical_project_id = project_id
+    log.info(
+        "Infisical project '%s' created (env slug for lookups: %s).",
+        config.infisical_project_name, config.infisical_env_slug,
+    )
+
+    state.complete("infisical_seed")
+    log.info("Infisical seeding complete.")
+
+
+def migrate_secrets_to_infisical(config: Config, home: str, state: State) -> None:
+    """Upload generated secrets into the seeded Infisical project (env =
+    infisical_env_slug, path '/') so the ansible integration can read them from
+    Infisical instead of files. Idempotent (creates, else updates). Skipped when
+    seeding did not run (e.g. an existing Machine Identity was supplied)."""
+    if not config.infisical_enabled or config.infisical_client_id:
+        return
+    if not state.is_complete("infisical_seed"):
+        log.warning("Infisical not seeded; skipping secret migration.")
+        return
+    if state.is_complete("infisical_secrets_migrated"):
+        log.info("Infisical secrets already migrated (state checkpoint).")
+        return
+
+    token = state.get("infisical_admin_token")
+    project_id = state.get("infisical_project_id")
+    env = config.infisical_env_slug
+    base_url = f"http://{config.infisical_bind_host}:{config.infisical_bind_port}"
+
+    items: Dict[str, str] = {
+        "AWX_ADMIN_PASSWORD": config.awx_admin_password,
+        "AWX_DB_PASSWORD": state.get("db_password") or "",
+    }
+    # AWX API token (created during awx_bootstrap) — so the lookup finds it in
+    # Infisical instead of falling back to the file.
+    api_token_file = Path(home) / "secrets" / ".api_token"
+    if api_token_file.is_file():
+        try:
+            items["AWX_API_TOKEN"] = read_secret_file(api_token_file)
+        except OSError:
+            pass
+    if config.netbox_token:
+        items["NETBOX_TOKEN"] = config.netbox_token
+    deploy_key = Path(home) / "keys" / "deploy_key"
+    if deploy_key.is_file():
+        items["AWX_DEPLOY_PRIVATE_KEY"] = deploy_key.read_text()
+
+    def _upsert(name: str, value: str) -> None:
+        payload = {
+            "workspaceId": project_id,
+            "environment": env,
+            "secretPath": "/",
+            "type": "shared",
+            "secretValue": value,
+            "skipMultilineEncoding": True,
+        }
+        status, body = awx_api_call(
+            "POST", base_url, f"/api/v3/secrets/raw/{name}", token=token, data=payload,
+        )
+        if status in (200, 201):
+            return
+        # Secret already exists → update it instead.
+        status, body = awx_api_call(
+            "PATCH", base_url, f"/api/v3/secrets/raw/{name}", token=token, data=payload,
+        )
+        if status not in (200, 201):
+            log.warning(
+                "Could not store Infisical secret '%s' (HTTP %s): %s", name, status, body
+            )
+
+    log.info("Migrating %d secret(s) into Infisical project ...", len([v for v in items.values() if v]))
+    for name, value in items.items():
+        if value:
+            _upsert(name, value)
+    state.complete("infisical_secrets_migrated")
+    log.info("Secret migration into Infisical complete.")
 
 
 # ---------------------------------------------------------------------------
@@ -4985,7 +6535,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--force-pull",
         action="store_true",
-        help="Force re-pull of the AWX image even if already pulled.",
+        help=(
+            "Force image preparation even if already done: re-pull base images, "
+            "rebuild the custom AWX/receptor images from their Dockerfiles, and "
+            "recreate the containers so they run the freshly built image."
+        ),
     )
     parser.add_argument(
         "--fresh-reinstall",
@@ -5109,10 +6663,26 @@ def main() -> None:
     answers_file = _answers_path()
     answers = _load_answers(answers_file)
 
-    if state.is_complete("params_collected") and not args.reconfigure:
+    # Detect configuration options that were added since the answers were last
+    # saved (i.e. a new feature like Infisical): such fields are absent as keys
+    # from BOTH the stored config and the answers file. If any are missing we run
+    # the questionnaire (pre-loading existing answers as defaults) so the operator
+    # is asked about the new options instead of them silently defaulting off.
+    _stored_cfg = state.get("config", {})
+    _expected_answer_fields = {
+        f.name for f in dataclasses.fields(Config)
+    } - _ANSWERS_EXCLUDE
+    _present_keys = set(_stored_cfg) | set(answers)
+    _missing_answer_fields = _expected_answer_fields - _present_keys
+
+    if (
+        state.is_complete("params_collected")
+        and not args.reconfigure
+        and not _missing_answer_fields
+    ):
         # Skip the questionnaire — use the config stored from the previous run.
         # Merge: answers file wins over state so edits to .answers.json are picked up.
-        stored_cfg = state.get("config", {})
+        stored_cfg = _stored_cfg
         merged = {
             **{k: v for k, v in stored_cfg.items() if k not in _ANSWERS_EXCLUDE},
             **answers,
@@ -5126,21 +6696,32 @@ def main() -> None:
         config.selinux_mode = selinux_mode
         config.platform = platform_id
         config.ansible_home = home
-        # Restore password from state (never stored in answers file).
+        # Restore secrets from state (never stored in answers file).
         config.awx_admin_password = stored_cfg.get("awx_admin_password", "")
+        config.netbox_token = stored_cfg.get("netbox_token", "")
+        config.ldap_bind_password = stored_cfg.get("ldap_bind_password", "")
         log.info(
             "Using stored answers (run with --reconfigure to change).",
         )
     else:
-        # First run or operator requested reconfiguration: run questionnaire.
+        # First run, operator requested reconfiguration, or newly-added options
+        # need answers: run the questionnaire.
         if state.is_complete("params_collected"):
-            # --reconfigure: pre-load previous answers as defaults.
-            stored_cfg = state.get("config", {})
+            # Pre-load previous answers as defaults so only changed/new options
+            # need attention.
+            stored_cfg = _stored_cfg
             answers = {
                 **{k: v for k, v in stored_cfg.items() if k not in _ANSWERS_EXCLUDE},
                 **answers,
             }
-            log.info("Re-running questionnaire with previous answers as defaults.")
+            if _missing_answer_fields and not args.reconfigure:
+                log.info(
+                    "New configuration options detected (%s) — prompting for them "
+                    "(existing answers kept as defaults).",
+                    ", ".join(sorted(_missing_answer_fields)),
+                )
+            else:
+                log.info("Re-running questionnaire with previous answers as defaults.")
         elif answers:
             log.info(
                 "Loaded %d answer(s) from %s.", len(answers), answers_file
@@ -5240,6 +6821,7 @@ def main() -> None:
             state,
             non_interactive=args.non_interactive,
             assume_git_key_ready=args.assume_git_key_ready,
+            force_reseed=args.force_pull,
         )
 
     # ── Phase: Install NGINX ─────────────────────────────────────
@@ -5305,6 +6887,25 @@ def main() -> None:
         else:
             log.info("Certbot certificate already obtained (state checkpoint).")
 
+    # ── Phase: acme.sh ───────────────────────────────────────────
+    # Uses a pre-existing acme.sh (HTTP-01 via --nginx). Like certbot_http, nginx
+    # must serve HTTP for the domain first; renewals are handled by acme.sh's cron.
+    if config.ssl_mode == "acme_sh":
+        if not state.is_complete("acme_obtain"):
+            temp_ssl_mode = config.ssl_mode
+            config.ssl_mode = "none"
+            http_conf = gen_nginx_config(config)
+            config.ssl_mode = temp_ssl_mode
+            nginx_canon = Path(home) / "nginx" / f"{config.fqdn}.conf"
+            nginx_canon.write_text(http_conf)
+            write_nginx_config(config, home, platform_adapter)
+            validate_reload_nginx()
+
+            run_acme_sh(config, home)
+            state.complete("acme_obtain")
+        else:
+            log.info("acme.sh certificate already obtained (state checkpoint).")
+
     # ── Phase: Write NGINX config (final, with SSL if applicable) ─
     if not state.is_complete("nginx_config"):
         nginx_canon = Path(home) / "nginx" / f"{config.fqdn}.conf"
@@ -5334,7 +6935,10 @@ def main() -> None:
     pull_image(config, compose_cmd, compose_file, state, force=args.force_pull)
 
     # ── Phase: Start containers ──────────────────────────────────
-    start_containers(compose_cmd, compose_file, state, home, config)
+    # --force-pull rebuilds the custom AWX image; recreate containers so they
+    # actually run the new image (awx_settings.py fingerprint alone won't change).
+    start_containers(compose_cmd, compose_file, state, home, config,
+                     force_recreate=args.force_pull)
 
     # ── Phase: Bootstrap AWX API ─────────────────────────────────
     awx_bootstrap(
@@ -5343,7 +6947,47 @@ def main() -> None:
         state,
         non_interactive=args.non_interactive,
         assume_git_key_ready=args.assume_git_key_ready,
+        force_sync=args.force_pull,
     )
+
+    # Provision the NetBox dynamic inventory in AWX (credential + SCM source).
+    provision_netbox_inventory(config, home, state, force=args.force_pull)
+
+    # AWX LDAP/AD authentication — independent of Infisical.
+    provision_awx_ldap(config, home, state)
+
+    # Infisical user integration (decision from the dialog).
+    if config.infisical_user_sync == "idp":
+        provision_infisical_ldap(config, home, state)
+    elif config.infisical_user_sync == "autoinvite":
+        infisical_invite_awx_users(config, home, state)
+
+    # ── Phase: Deploy Infisical ──────────────────────────────────
+    # After AWX (and its PostgreSQL) is up: provision the infisical DB, obtain
+    # its certificate, deploy its vhost, bring up its compose stack, then seed
+    # the instance (admin user + organization + project) via the Infisical API.
+    if config.infisical_enabled:
+        deploy_infisical(config, home, compose_cmd, platform_adapter, state)
+        seed_infisical(config, home, state, uid, gid)
+        # When an existing Machine Identity was supplied (seeding skipped), make
+        # sure the configured project still exists so the lookup matches.
+        ensure_infisical_project(config, home, state)
+        migrate_secrets_to_infisical(config, home, state)
+        # Bake the seeded project id into group_vars and persist it to answers so
+        # ansible runs know which Infisical project to read secrets from.
+        if config.infisical_project_id:
+            gv = Path(home) / "inventories" / "static" / "group_vars" / "all" / "main.yml"
+            gv.write_text(gen_group_vars_all(config))
+            os.chown(gv, uid, gid)
+            _save_answers(answers_file, config)
+        # Inject the Infisical connection (URL/token-or-client-creds/project/env)
+        # into AWX job runs via a credential, so the lookup uses the seeded
+        # project automatically with no manual env setup.
+        provision_infisical_awx_credential(config, home, state)
+
+    # Create a job template for each playbook checked out from the SCM project
+    # (runs last so the machine + Infisical credentials exist to pre-attach).
+    provision_job_templates_from_playbooks(config, home, state)
 
     # ── Phase: Final NGINX reload ────────────────────────────────
     validate_reload_nginx()
