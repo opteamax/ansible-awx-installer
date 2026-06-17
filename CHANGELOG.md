@@ -115,6 +115,30 @@ and `README.md`.
 
 ### Fixed
 
+- **Login over plain HTTP (`ssl_mode: none`) failed with a missing CSRF header.**
+  The generated AWX `settings.py` now emits `CSRF_TRUSTED_ORIGINS` for the
+  deployment's scheme/host(/port), sets `SECURE_PROXY_SSL_HEADER` (so Django
+  computes `request.is_secure()` correctly behind the nginx proxy), and turns
+  off `SESSION_COOKIE_SECURE`/`CSRF_COOKIE_SECURE` when no TLS is used — so the
+  browser keeps the CSRF cookie and the login POST carries `X-CSRFToken`.
+- **Adding a DNS provider via git URL failed with `pip3: command not found`.**
+  DNS plugins are now installed via `python -m pip` into the interpreter certbot
+  actually uses (resolved from certbot's shebang), bootstrapping pip via
+  `ensurepip`/`python3-pip` when absent and adding `--break-system-packages` on
+  PEP-668 externally-managed systems. snap-based certbot installs published
+  plugins via `snap` instead, with a clear error when a custom git/pip plugin is
+  requested under snap.
+
+### Added (DNS)
+
+- Expanded the Certbot DNS provider list to ~30 verified plugins, presented as a
+  menu in the dialog (plus a `custom` option for any pip package or git URL with
+  an operator-supplied authenticator name). Each provider's credential keys are
+  prompted for and written automatically; optional fields, ambient-credential
+  providers (Route 53), and file-based credentials (Google service-account JSON)
+  are handled, and the correct `--authenticator`/propagation flags are passed to
+  certbot.
+
 - `awx_config` role generator: removed the invalid `awx.awx` role dependency from
   role meta (it is a collection used via FQCN) and dropped the dead
   `community.docker` handler reference.

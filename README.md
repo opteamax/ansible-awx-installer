@@ -111,7 +111,19 @@ Runtime data and generated assets are stored under:
   - acme_sh — issue/install a certificate with a pre-existing acme.sh
     (HTTP-01 via `--nginx`); prompts for the acme.sh base directory. acme.sh's
     own cron handles renewals.
-- Supports known DNS providers for Certbot DNS plugins
+- Supports ~30 known DNS providers for Certbot DNS plugins (Cloudflare, Route 53,
+  Google Cloud DNS, DigitalOcean, OVH, Hetzner, Gandi, Linode, netcup, IONOS,
+  GoDaddy, deSEC, Porkbun, INWX, Vultr, RFC2136, and more), selectable from a
+  menu in the dialog. Required credentials are prompted for and the credentials
+  file is generated automatically; ambient-credential providers (Route 53) and
+  file-based credentials (Google service-account JSON) are handled, and a
+  `custom` choice installs any other plugin from a pip package or git URL.
+  Plugins are installed into the same Python environment certbot runs from
+  (pip is bootstrapped if missing; PEP-668 externally-managed environments and
+  snap-based certbot are handled).
+- For `none` (plain HTTP) deployments, AWX is configured with the matching
+  `CSRF_TRUSTED_ORIGINS` and non-secure session/CSRF cookies so login works
+  without TLS.
 - The generated `ansible.cfg` uses repo-relative `roles_path = roles` and
   `collections_path = collections:...` (so roles/collections resolve both for
   local runs and under AWX/ansible-runner at `/runner/project`), sets a portable
@@ -289,8 +301,9 @@ SSL/TLS:
 - ssl_cert_path (provided mode)
 - ssl_key_path (provided mode)
 - certbot_email
-- certbot_dns_provider
-- certbot_dns_plugin_source
+- certbot_dns_provider (a known provider name or `custom`)
+- certbot_dns_plugin_source (custom provider: pip package or git URL)
+- certbot_dns_plugin_name (custom provider: certbot authenticator name, e.g. `dns-foo`)
 - acme_sh_basedir (acme_sh mode)
 
 Authentication (LDAP / Microsoft AD — optional, independent of Infisical):
@@ -581,7 +594,19 @@ Laufzeitdaten und generierte Artefakte liegen standardmäßig unter:
   - acme_sh — Zertifikat über ein vorhandenes acme.sh ausstellen/installieren
     (HTTP-01 via `--nginx`); fragt das acme.sh-Basisverzeichnis ab. Erneuerung
     übernimmt der acme.sh-eigene Cron.
-- Unterstützt bekannte DNS Provider für Certbot DNS Plugins
+- Unterstützt ~30 bekannte DNS-Provider für Certbot-DNS-Plugins (Cloudflare,
+  Route 53, Google Cloud DNS, DigitalOcean, OVH, Hetzner, Gandi, Linode, netcup,
+  IONOS, GoDaddy, deSEC, Porkbun, INWX, Vultr, RFC2136 u. a.), auswählbar über ein
+  Menü im Dialog. Die benötigten Zugangsdaten werden abgefragt und die
+  Credentials-Datei automatisch erzeugt; Provider mit Umgebungs-Credentials
+  (Route 53) und dateibasierte Credentials (Google Service-Account-JSON) werden
+  ebenso unterstützt. Mit der Auswahl `custom` lässt sich jedes weitere Plugin
+  aus einem pip-Paket oder einer Git-URL installieren. Plugins werden in dieselbe
+  Python-Umgebung installiert, aus der certbot läuft (pip wird bei Bedarf
+  bereitgestellt; PEP-668- und Snap-certbot-Umgebungen werden berücksichtigt).
+- Bei `none` (reines HTTP) wird AWX mit passenden `CSRF_TRUSTED_ORIGINS` und
+  nicht-sicheren Session-/CSRF-Cookies konfiguriert, damit der Login ohne TLS
+  funktioniert.
 - Die generierte `ansible.cfg` nutzt repo-relative `roles_path = roles` und
   `collections_path = collections:...` (damit Rollen/Collections lokal und unter
   AWX/ansible-runner unter `/runner/project` aufgelöst werden), setzt ein
@@ -766,8 +791,9 @@ SSL/TLS:
 - ssl_cert_path (bei provided)
 - ssl_key_path (bei provided)
 - certbot_email
-- certbot_dns_provider
-- certbot_dns_plugin_source
+- certbot_dns_provider (a known provider name or `custom`)
+- certbot_dns_plugin_source (custom provider: pip package or git URL)
+- certbot_dns_plugin_name (custom provider: certbot authenticator name, e.g. `dns-foo`)
 - acme_sh_basedir (bei acme_sh)
 
 Authentifizierung (LDAP / Microsoft AD — optional, unabhängig von Infisical):

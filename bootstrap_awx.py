@@ -12,6 +12,7 @@ import argparse
 import base64
 import dataclasses
 import getpass
+import glob
 import hashlib
 import json
 import logging
@@ -41,30 +42,80 @@ AWX_DEFAULT_PORT = 8052
 REDIS_DEFAULT_TAG = "7-alpine"
 POSTGRES_DEFAULT_TAG = "16"
 
+# Registry of Certbot DNS-01 plugins the installer can set up automatically.
+#
+# Each entry's KEY is the certbot authenticator/plugin name (used as
+# `certbot --authenticator dns-<key>` and to derive `--dns-<key>-credentials`
+# and `--dns-<key>-propagation-seconds`). Per-entry keys:
+#   package      pip package (or apt/snap name) to install the plugin.
+#   fields       ordered {ini_key: human label} written to the credentials file.
+#   optional     set of field keys that may be left blank (omitted from the file).
+#   ambient      True  -> no credentials file (provider uses env vars / IAM, e.g. route53).
+#   credential_file  True -> the credential is a whole file the operator already
+#                    has (e.g. a Google service-account JSON); we copy it instead
+#                    of writing an ini.
+#   propagation_seconds  int -> passed as --dns-<key>-propagation-seconds for
+#                    providers that propagate slowly.
+# Field key names were verified against each plugin's README / certbot docs.
 KNOWN_DNS_PLUGIN_CREDENTIALS: Dict[str, Any] = {
+    # ── Official certbot plugins ─────────────────────────────────
     "cloudflare": {
         "package": "certbot-dns-cloudflare",
-        "credentials_arg": "--dns-cloudflare-credentials",
         "fields": {"dns_cloudflare_api_token": "Cloudflare API Token"},
+        "propagation_seconds": 60,
     },
     "route53": {
         "package": "certbot-dns-route53",
-        "credentials_arg": None,
+        "ambient": True,  # AWS credentials via env vars / IAM role / ~/.aws
         "fields": {},
+    },
+    "google": {
+        "package": "certbot-dns-google",
+        "credential_file": True,  # service-account JSON key file
+        "credential_file_label": "Path to Google service-account JSON key file",
+        "credential_file_name": "google.json",
+        "propagation_seconds": 60,
     },
     "digitalocean": {
         "package": "certbot-dns-digitalocean",
-        "credentials_arg": "--dns-digitalocean-credentials",
         "fields": {"dns_digitalocean_token": "DigitalOcean API Token"},
     },
-    "hetzner": {
-        "package": "certbot-dns-hetzner",
-        "credentials_arg": "--dns-hetzner-credentials",
-        "fields": {"dns_hetzner_api_token": "Hetzner DNS API Token"},
+    "dnsimple": {
+        "package": "certbot-dns-dnsimple",
+        "fields": {"dns_dnsimple_token": "DNSimple API OAuth token"},
+    },
+    "dnsmadeeasy": {
+        "package": "certbot-dns-dnsmadeeasy",
+        "fields": {
+            "dns_dnsmadeeasy_api_key": "DNS Made Easy API key",
+            "dns_dnsmadeeasy_secret_key": "DNS Made Easy secret key",
+        },
+    },
+    "gehirn": {
+        "package": "certbot-dns-gehirn",
+        "fields": {
+            "dns_gehirn_api_token": "Gehirn API token",
+            "dns_gehirn_api_secret": "Gehirn API secret",
+        },
+    },
+    "linode": {
+        "package": "certbot-dns-linode",
+        "fields": {"dns_linode_key": "Linode API key"},
+        "propagation_seconds": 120,
+    },
+    "luadns": {
+        "package": "certbot-dns-luadns",
+        "fields": {
+            "dns_luadns_email": "LuaDNS account email",
+            "dns_luadns_token": "LuaDNS API token",
+        },
+    },
+    "nsone": {
+        "package": "certbot-dns-nsone",
+        "fields": {"dns_nsone_api_key": "NS1 API key"},
     },
     "ovh": {
         "package": "certbot-dns-ovh",
-        "credentials_arg": "--dns-ovh-credentials",
         "fields": {
             "dns_ovh_endpoint": "OVH endpoint (e.g. ovh-eu)",
             "dns_ovh_application_key": "Application key",
@@ -72,21 +123,158 @@ KNOWN_DNS_PLUGIN_CREDENTIALS: Dict[str, Any] = {
             "dns_ovh_consumer_key": "Consumer key",
         },
     },
-    "linode": {
-        "package": "certbot-dns-linode",
-        "credentials_arg": "--dns-linode-credentials",
-        "fields": {"dns_linode_key": "Linode API key"},
+    "rfc2136": {
+        "package": "certbot-dns-rfc2136",
+        "fields": {
+            "dns_rfc2136_server": "Target DNS server (IPv4/IPv6 address)",
+            "dns_rfc2136_port": "Target DNS port (default 53)",
+            "dns_rfc2136_name": "TSIG key name",
+            "dns_rfc2136_secret": "TSIG key secret",
+            "dns_rfc2136_algorithm": "TSIG algorithm (e.g. HMAC-SHA512)",
+        },
+        "optional": {"dns_rfc2136_port", "dns_rfc2136_algorithm"},
+    },
+    "sakuracloud": {
+        "package": "certbot-dns-sakuracloud",
+        "fields": {
+            "dns_sakuracloud_api_token": "Sakura Cloud API token",
+            "dns_sakuracloud_api_secret": "Sakura Cloud API secret",
+        },
+        "propagation_seconds": 90,
+    },
+    # ── Third-party plugins (PyPI) ───────────────────────────────
+    "hetzner": {
+        "package": "certbot-dns-hetzner",
+        "fields": {"dns_hetzner_api_token": "Hetzner DNS API token"},
     },
     "gandi": {
         "package": "certbot-dns-gandi",
-        "credentials_arg": "--dns-gandi-credentials",
-        "fields": {"dns_gandi_api_key": "Gandi API key"},
+        "fields": {
+            "dns_gandi_token": "Gandi Personal Access Token (PAT)",
+            "dns_gandi_sharing_id": "Sharing/organization ID (optional)",
+        },
+        "optional": {"dns_gandi_sharing_id"},
+    },
+    "godaddy": {
+        "package": "certbot-dns-godaddy",
+        "fields": {
+            "dns_godaddy_key": "GoDaddy API key",
+            "dns_godaddy_secret": "GoDaddy API secret",
+        },
+        "propagation_seconds": 600,
+    },
+    "namecheap": {
+        "package": "certbot-dns-namecheap",
+        "fields": {
+            "dns_namecheap_username": "Namecheap account username",
+            "dns_namecheap_api_key": "Namecheap API key",
+        },
+    },
+    "porkbun": {
+        "package": "certbot-dns-porkbun",
+        "fields": {
+            "dns_porkbun_key": "Porkbun API key",
+            "dns_porkbun_secret": "Porkbun API secret",
+        },
+        "propagation_seconds": 60,
+    },
+    "inwx": {
+        "package": "certbot-dns-inwx",
+        "fields": {
+            "dns_inwx_url": "INWX JSON-RPC API endpoint URL",
+            "dns_inwx_username": "INWX account username",
+            "dns_inwx_password": "INWX account password",
+            "dns_inwx_shared_secret": "TOTP/2FA shared secret (optional)",
+        },
+        "optional": {"dns_inwx_shared_secret"},
+        "propagation_seconds": 60,
+    },
+    "netcup": {
+        "package": "certbot-dns-netcup",
+        "fields": {
+            "dns_netcup_customer_id": "Netcup customer number",
+            "dns_netcup_api_key": "Netcup CCP API key",
+            "dns_netcup_api_password": "Netcup CCP API password",
+        },
+        "propagation_seconds": 900,
+    },
+    "ionos": {
+        "package": "certbot-dns-ionos",
+        "fields": {
+            "dns_ionos_prefix": "IONOS API key prefix (public part)",
+            "dns_ionos_secret": "IONOS API key secret",
+            "dns_ionos_endpoint": "API base URL (optional)",
+        },
+        "optional": {"dns_ionos_endpoint"},
+        "propagation_seconds": 60,
+    },
+    "vultr": {
+        "package": "certbot-dns-vultr",
+        "fields": {"dns_vultr_key": "Vultr API key"},
+    },
+    "desec": {
+        "package": "certbot-dns-desec",
+        "fields": {
+            "dns_desec_token": "deSEC API token",
+            "dns_desec_endpoint": "API endpoint (optional)",
+        },
+        "optional": {"dns_desec_endpoint"},
+    },
+    "njalla": {
+        "package": "certbot-dns-njalla",
+        "fields": {"dns_njalla_token": "Njalla API token"},
+    },
+    "duckdns": {
+        "package": "certbot-dns-duckdns",
+        "fields": {"dns_duckdns_token": "DuckDNS account token"},
+    },
+    "infomaniak": {
+        "package": "certbot-dns-infomaniak",
+        "fields": {"dns_infomaniak_token": "Infomaniak API token"},
+    },
+    "transip": {
+        "package": "certbot-dns-transip",
+        "fields": {
+            "dns_transip_username": "TransIP account username",
+            "dns_transip_key_file": "Path to the TransIP RSA private key file",
+            "dns_transip_global_key": "Set to 'yes' for a global/whitelisted key (optional)",
+        },
+        "optional": {"dns_transip_global_key"},
+        "propagation_seconds": 240,
+    },
+    "powerdns": {
+        "package": "certbot-dns-powerdns",
+        "fields": {
+            "dns_powerdns_api_url": "PowerDNS API endpoint URL",
+            "dns_powerdns_api_key": "PowerDNS API key",
+        },
+    },
+    "bunny": {
+        "package": "certbot-dns-bunny",
+        "fields": {"dns_bunny_api_key": "Bunny.net API key"},
+        "propagation_seconds": 60,
     },
 }
 
 REDACT_PATTERNS = re.compile(
     r"(password|secret|token|key|passwd|cred)", re.IGNORECASE
 )
+
+# Credential ini keys that look sensitive but are really identifiers/paths and
+# should be echoed normally when prompting (and never no-echo). Checked before
+# the secret heuristic below.
+_NONSECRET_FIELD_HINTS: Tuple[str, ...] = (
+    "endpoint", "url", "username", "user", "email", "prefix", "server",
+    "port", "algorithm", "customer", "version", "_file", "sharing_id", "name",
+)
+
+
+def _is_secret_field(key: str) -> bool:
+    """Whether a DNS credential field should be prompted without echo."""
+    k = key.lower()
+    if any(h in k for h in _NONSECRET_FIELD_HINTS):
+        return False
+    return any(h in k for h in ("secret", "token", "password", "key", "pass", "consumer"))
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -245,8 +433,9 @@ class Config:
     ssl_cert_path: str = ""
     ssl_key_path: str = ""
     certbot_email: str = ""
-    certbot_dns_provider: str = ""
-    certbot_dns_plugin_source: str = ""  # pip or git URL
+    certbot_dns_provider: str = ""  # key in KNOWN_DNS_PLUGIN_CREDENTIALS, or "custom"
+    certbot_dns_plugin_source: str = ""  # pip package or git URL (custom provider)
+    certbot_dns_plugin_name: str = ""  # certbot authenticator name for custom plugin (e.g. dns-foo)
     acme_sh_basedir: str = "/root/.acme.sh"  # dir containing acme.sh (HTTP-01 via --nginx)
     db_mode: str = "container"  # container | external
     db_host: str = "postgres"
@@ -704,6 +893,16 @@ def prompt_password(label: str) -> str:
         print("  Password cannot be empty.")
 
 
+def _print_in_columns(items: List[str], columns: int = 4, indent: str = "    ") -> None:
+    """Print a list of short strings in aligned columns for a tidy menu."""
+    if not items:
+        return
+    width = max(len(s) for s in items) + 2
+    for i in range(0, len(items), columns):
+        row = items[i:i + columns]
+        print(indent + "".join(s.ljust(width) for s in row).rstrip())
+
+
 def prompt_confirm(label: str, default: bool = False) -> bool:
     """Yes/No confirmation prompt."""
     hint = "Y/n" if default else "y/N"
@@ -926,19 +1125,25 @@ def collect_params(
         )
 
     if cfg.ssl_mode == "certbot_dns":
-        known_providers = list(KNOWN_DNS_PLUGIN_CREDENTIALS.keys())
-        print(f"  Known DNS providers: {', '.join(known_providers)}")
+        providers = sorted(KNOWN_DNS_PLUGIN_CREDENTIALS.keys())
+        choices = providers + ["custom"]
+        print("  Supported DNS providers (choose one, or 'custom' for any other plugin):")
+        _print_in_columns(choices)
         cfg.certbot_dns_provider = prompt(
-            "DNS provider name (or leave blank for custom)",
+            "DNS provider",
             default=answers.get("certbot_dns_provider", ""),
-            required=False,
+            choices=choices,
         )
-        if cfg.certbot_dns_provider and cfg.certbot_dns_provider not in KNOWN_DNS_PLUGIN_CREDENTIALS:
-            print(f"  Unknown provider '{cfg.certbot_dns_provider}' – you will supply a git/pip source.")
-        if not cfg.certbot_dns_provider or cfg.certbot_dns_provider not in KNOWN_DNS_PLUGIN_CREDENTIALS:
+        if cfg.certbot_dns_provider == "custom":
             cfg.certbot_dns_plugin_source = prompt(
                 "DNS plugin pip package or git URL",
                 default=answers.get("certbot_dns_plugin_source", ""),
+            )
+            cfg.certbot_dns_plugin_name = prompt(
+                "certbot authenticator name for this plugin (e.g. dns-foo)",
+                default=answers.get("certbot_dns_plugin_name", ""),
+                validator=lambda v: None if re.match(r"^[a-z0-9][a-z0-9-]*$", v)
+                else "Lowercase letters, digits and hyphens only (e.g. dns-foo)",
             )
 
     # ── Database ─────────────────────────────────────────────────
@@ -1968,21 +2173,60 @@ server {{
 """
 
 
-def gen_awx_settings_py() -> str:
+def gen_awx_settings_py(config: Config) -> str:
     """Generate /etc/tower/settings.py for AWX containers.
 
     AWX's production.py unconditionally includes this file at startup.
     We keep it minimal: actual DB/Redis/secret credentials arrive as
     environment variables injected by docker-compose.
     """
-    return """\
+    # ── CSRF / cookie security ───────────────────────────────────
+    # AWX runs Django, which (4.x) rejects unsafe requests unless the browser's
+    # Origin matches CSRF_TRUSTED_ORIGINS *and* it can present the csrftoken
+    # cookie. AWX ships with secure cookies on, so over plain HTTP the browser
+    # silently drops the Secure-flagged csrftoken cookie → the login POST has no
+    # X-CSRFToken header → "CSRF Failed / missing CSRF header". When we deploy
+    # without TLS we must therefore turn the Secure flag off and trust the
+    # http:// origin explicitly.
+    scheme = "http" if config.ssl_mode == "none" else "https"
+    secure_cookies = scheme == "https"
+
+    origins: List[str] = []
+    if scheme == "https":
+        origins.append(f"https://{config.fqdn}")
+        if config.nginx_https_port != 443:
+            origins.append(f"https://{config.fqdn}:{config.nginx_https_port}")
+    else:
+        origins.append(f"http://{config.fqdn}")
+        if config.nginx_http_port != 80:
+            origins.append(f"http://{config.fqdn}:{config.nginx_http_port}")
+
+    csrf_block = f"""\
+# Public-facing origins AWX must trust (scheme matters in Django 4.x).
+CSRF_TRUSTED_ORIGINS = {origins!r}
+
+# nginx terminates TLS and forwards the original scheme in X-Forwarded-Proto;
+# this lets Django compute request.is_secure() correctly behind the proxy.
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+
+# Without TLS the Secure cookie flag would prevent the browser from ever
+# sending the session/CSRF cookies back, breaking login.
+SESSION_COOKIE_SECURE = {secure_cookies!r}
+CSRF_COOKIE_SECURE = {secure_cookies!r}
+"""
+
+    header = f"""\
 # AWX settings override – generated by bootstrap_awx.py
 # DB, Redis, and secret credentials arrive via docker-compose environment variables.
 import os
 
 ALLOWED_HOSTS = ['*']
 
+{csrf_block}
 SECRET_KEY = os.environ.get('SECRET_KEY', '')
+"""
+
+    body = """\
 
 DATABASES = {
     'default': {
@@ -2023,6 +2267,8 @@ AWX_ISOLATION_SHOW_PATHS = []
 
 AWX_ISOLATION_BASE_PATH = '/awxdata'
 """
+
+    return header + body
 
 
 def gen_awx_container_nginx_config() -> str:
@@ -3082,7 +3328,7 @@ def write_all_files(
     write_file("compose/awx/.env", gen_compose_env(config))
 
     # AWX Django settings (mounted into containers at /etc/tower/settings.py)
-    write_file("config/awx_settings.py", gen_awx_settings_py())
+    write_file("config/awx_settings.py", gen_awx_settings_py(config))
 
     # AWX container nginx config (mounted at /etc/nginx/conf.d/awx.conf)
     write_file("config/awx_nginx.conf", gen_awx_container_nginx_config())
@@ -5724,20 +5970,99 @@ def install_certbot(platform_adapter: PlatformAdapter, state: State) -> None:
     log.info("Certbot installed.")
 
 
+def _certbot_runtime() -> Tuple[bool, str]:
+    """Inspect the installed certbot. Return (is_snap, python_interpreter).
+
+    DNS plugins must be installed into the *same* Python environment certbot
+    runs from. We read certbot's shebang to find that interpreter; a shebang
+    under /snap means certbot is the confined snap (which cannot load
+    pip-installed plugins — they must come from snap instead).
+    """
+    certbot = shutil.which("certbot")
+    if certbot:
+        try:
+            first_line = Path(certbot).read_text(errors="ignore").splitlines()[0]
+        except (OSError, IndexError):
+            first_line = ""
+        if first_line.startswith("#!"):
+            interp = first_line[2:].strip().split()[0]
+            if "/snap/" in interp:
+                return True, interp
+            if interp and Path(interp).exists():
+                return False, interp
+    # Fall back to a sane system interpreter for pip installs.
+    for cand in ("/usr/bin/python3", sys.executable, "python3"):
+        if cand and (cand == "python3" or Path(cand).exists()):
+            return False, cand
+    return False, "python3"
+
+
+def _pip_externally_managed(python: str) -> bool:
+    """True if the interpreter's environment is PEP-668 externally managed."""
+    try:
+        marker = run_capture([
+            python, "-c",
+            "import os,sysconfig;print(os.path.join(sysconfig.get_path('stdlib'),'EXTERNALLY-MANAGED'))",
+        ]).strip()
+        if marker and Path(marker).exists():
+            return True
+    except (subprocess.CalledProcessError, OSError):
+        pass
+    return any(Path(p).exists() for p in glob.glob("/usr/lib/python3*/EXTERNALLY-MANAGED"))
+
+
+def _ensure_pip(python: str, platform_adapter: PlatformAdapter) -> None:
+    """Make sure `python -m pip` works, bootstrapping pip if necessary."""
+    if run_ok([python, "-m", "pip", "--version"]):
+        return
+    log.info("pip not available for %s – bootstrapping ...", python)
+    if run_ok([python, "-m", "ensurepip", "--upgrade"]):
+        return
+    # ensurepip is often stripped from distro pythons; install the OS package.
+    platform_adapter.pkg_install(["python3-pip"])
+    if not run_ok([python, "-m", "pip", "--version"]):
+        raise RuntimeError(
+            f"Could not make pip available for {python}; install python3-pip manually."
+        )
+
+
 def install_dns_plugin(
     source: str,
     name: str,
-    install_dir: str,
+    platform_adapter: PlatformAdapter,
 ) -> str:
-    """Install a Certbot DNS plugin from pip package name or git URL. Return installed name."""
+    """Install a Certbot DNS plugin from a pip package name or git URL.
+
+    Installs into the environment certbot actually uses (snap or system Python),
+    bootstrapping pip and handling PEP-668 externally-managed environments.
+    Returns the plugin name.
+    """
     log.info("Installing DNS plugin '%s' from '%s' ...", name, source)
+    is_git = source.startswith("git+") or source.startswith("https://") or source.endswith(".git")
 
-    if source.startswith("git+") or source.startswith("https://") or source.endswith(".git"):
-        pip_source = source if source.startswith("git+") else f"git+{source}"
-        run(["pip3", "install", "--quiet", pip_source])
-    else:
-        run(["pip3", "install", "--quiet", source])
+    is_snap, python = _certbot_runtime()
+    if is_snap:
+        if is_git:
+            raise RuntimeError(
+                "certbot is installed via snap, which cannot load pip/git DNS plugins. "
+                "Install certbot from your OS package manager (apt/dnf) to use a custom "
+                "plugin source, or pick a provider whose plugin is published on snap."
+            )
+        # snap-published plugins are named exactly like their pip package.
+        run(["snap", "install", source])
+        run(["snap", "set", "certbot", "trust-plugin-with-root=ok"])
+        run(["snap", "connect", f"certbot:plugin-{source}"])
+        log.info("DNS plugin installed via snap: %s", source)
+        return name
 
+    _ensure_pip(python, platform_adapter)
+    pip_source = (source if source.startswith("git+") else f"git+{source}") if is_git else source
+    cmd = [python, "-m", "pip", "install", "--quiet", pip_source]
+    if _pip_externally_managed(python):
+        # PEP-668 (Debian 13 / Ubuntu 24.04): allow installing into the
+        # certbot-owning system interpreter, which is what certbot imports from.
+        cmd.append("--break-system-packages")
+    run(cmd)
     log.info("DNS plugin installed: %s", source)
     return name
 
@@ -5763,33 +6088,74 @@ def detect_plugin_credentials(name: str, plugin_dir: str) -> List[str]:
     return fields
 
 
+def _certbot_secrets_dir(secrets_dir: str, uid: int, gid: int) -> Path:
+    """Return the (created, locked-down) certbot secrets directory."""
+    certbot_dir = Path(secrets_dir) / "certbot"
+    certbot_dir.mkdir(parents=True, exist_ok=True)
+    certbot_dir.chmod(0o700)
+    os.chown(certbot_dir, uid, gid)
+    return certbot_dir
+
+
 def collect_and_write_credentials(
     fields: Dict[str, str],
     plugin_name: str,
     secrets_dir: str,
     uid: int,
     gid: int,
+    optional: Optional[Set[str]] = None,
 ) -> str:
-    """Prompt user for DNS credential values and write to credentials file."""
-    certbot_dir = Path(secrets_dir) / "certbot"
-    certbot_dir.mkdir(parents=True, exist_ok=True)
-    certbot_dir.chmod(0o700)
-    os.chown(certbot_dir, uid, gid)
+    """Prompt user for DNS credential values and write to a credentials ini file.
 
+    Fields in `optional` may be left blank, in which case they are omitted from
+    the file (the plugin falls back to its own default). Secret-looking fields
+    are prompted without echo.
+    """
+    optional = optional or set()
+    certbot_dir = _certbot_secrets_dir(secrets_dir, uid, gid)
     creds_path = certbot_dir / f"{plugin_name}.ini"
 
     lines = [f"# Certbot DNS plugin credentials for {plugin_name}\n"]
     print(f"\nEnter credentials for DNS plugin '{plugin_name}':")
     for field_key, field_label in fields.items():
-        if any(kw in field_key.lower() for kw in ("secret", "key", "token", "password")):
+        is_optional = field_key in optional
+        if _is_secret_field(field_key) and not is_optional:
             val = prompt_password(f"  {field_label}")
         else:
-            val = prompt(f"  {field_label}")
+            val = prompt(f"  {field_label}", required=not is_optional)
+        if is_optional and not val:
+            continue
         lines.append(f"{field_key} = {val}\n")
 
     write_secret_file(creds_path, "".join(lines), uid, gid)
     log.info("Credentials written to %s", creds_path)
     return str(creds_path)
+
+
+def copy_credential_file(
+    plugin_name: str,
+    file_label: str,
+    file_name: str,
+    secrets_dir: str,
+    uid: int,
+    gid: int,
+) -> str:
+    """Prompt for a path to an existing credential file (e.g. a Google
+    service-account JSON) and copy it into the certbot secrets directory."""
+    certbot_dir = _certbot_secrets_dir(secrets_dir, uid, gid)
+    dest = certbot_dir / file_name
+
+    print(f"\nCredentials for DNS plugin '{plugin_name}':")
+    src = prompt(
+        f"  {file_label}",
+        validator=lambda v: None if Path(v).expanduser().is_file() else "File not found",
+    )
+    content = Path(src).expanduser().read_bytes()
+    dest.write_bytes(content)
+    dest.chmod(0o600)
+    os.chown(dest, uid, gid)
+    log.info("Credential file installed to %s", dest)
+    return str(dest)
 
 
 def run_certbot(
@@ -5813,18 +6179,25 @@ def run_certbot(
         cmd += ["--nginx"]
     elif config.ssl_mode == "certbot_dns":
         plugin_info = KNOWN_DNS_PLUGIN_CREDENTIALS.get(config.certbot_dns_provider, {})
-        plugin_name = config.certbot_dns_provider or "custom"
-        authenticator = f"--dns-{plugin_name}"
-        cmd += [authenticator]
+        # Authenticator name: for known providers it is "dns-<provider>"; for a
+        # custom plugin the operator supplied it explicitly (with/without "dns-").
+        if config.certbot_dns_provider == "custom":
+            raw = config.certbot_dns_plugin_name or "custom"
+            authenticator = raw if raw.startswith("dns-") else f"dns-{raw}"
+        else:
+            authenticator = f"dns-{config.certbot_dns_provider}"
 
-        creds_arg = plugin_info.get("credentials_arg")
-        if creds_arg and credentials_path:
+        # `--authenticator dns-<x>` works for both official and third-party
+        # plugins (third-party shorthand flags are not always registered).
+        cmd += ["--authenticator", authenticator]
+
+        creds_arg = plugin_info.get("credentials_arg") or f"--{authenticator}-credentials"
+        if credentials_path and not plugin_info.get("ambient"):
             cmd += [creds_arg, credentials_path]
-        elif credentials_path:
-            cmd += [f"--dns-{plugin_name}-credentials", credentials_path]
 
-        if plugin_name == "cloudflare":
-            cmd += ["--dns-cloudflare-propagation-seconds", "60"]
+        prop = plugin_info.get("propagation_seconds")
+        if prop:
+            cmd += [f"--{authenticator}-propagation-seconds", str(prop)]
 
     log.info("Running certbot to obtain certificate for %s ...", config.fqdn)
     run(cmd)
@@ -6840,32 +7213,62 @@ def main() -> None:
         install_certbot(platform_adapter, state)
 
         if config.ssl_mode == "certbot_dns":
+            plugin_info = KNOWN_DNS_PLUGIN_CREDENTIALS.get(config.certbot_dns_provider, {})
+            # Credential file is named after the provider (or the custom plugin).
+            creds_label = (
+                config.certbot_dns_plugin_name or "custom"
+                if config.certbot_dns_provider == "custom"
+                else config.certbot_dns_provider
+            )
+
             if not state.is_complete("certbot_dns_plugin"):
-                plugin_source = (
-                    KNOWN_DNS_PLUGIN_CREDENTIALS.get(config.certbot_dns_provider, {}).get("package")
-                    or config.certbot_dns_plugin_source
-                )
-                plugin_name = config.certbot_dns_provider or "custom"
-                install_dns_plugin(plugin_source, plugin_name, home)
+                plugin_source = plugin_info.get("package") or config.certbot_dns_plugin_source
+                install_dns_plugin(plugin_source, creds_label, platform_adapter)
                 state.complete("certbot_dns_plugin")
 
             if not state.is_complete("certbot_credentials"):
-                plugin_info = KNOWN_DNS_PLUGIN_CREDENTIALS.get(config.certbot_dns_provider, {})
-                fields = plugin_info.get("fields", {})
-                if fields:
-                    credentials_path = collect_and_write_credentials(
-                        fields,
+                secrets_root = str(Path(home) / "secrets")
+                if plugin_info.get("ambient"):
+                    # Provider uses ambient credentials (e.g. route53 via IAM/env vars).
+                    # No credential file needed; mark phase complete to avoid retrying.
+                    log.info(
+                        "DNS provider '%s' uses ambient credentials – no file written.",
                         config.certbot_dns_provider,
-                        str(Path(home) / "secrets"),
+                    )
+                elif plugin_info.get("credential_file"):
+                    credentials_path = copy_credential_file(
+                        creds_label,
+                        plugin_info.get("credential_file_label", "Path to credential file"),
+                        plugin_info.get("credential_file_name", f"{creds_label}.json"),
+                        secrets_root,
                         uid,
                         gid,
                     )
-                    state.set("certbot_credentials_path", credentials_path)
-                    state.complete("certbot_credentials")
                 else:
-                    # Provider uses ambient credentials (e.g. route53 via IAM/env vars).
-                    # No credential file needed; mark phase complete to avoid retrying.
-                    state.complete("certbot_credentials")
+                    fields = plugin_info.get("fields", {})
+                    optional = plugin_info.get("optional", set())
+                    if not fields and config.certbot_dns_provider == "custom":
+                        # Unknown plugin: ask the operator which credential keys it
+                        # needs (the names of the dns_* entries in its ini file).
+                        if prompt_confirm(
+                            "Does this DNS plugin require a credentials file?", default=True
+                        ):
+                            raw = prompt(
+                                "Credential ini keys (comma-separated, e.g. dns_foo_token)"
+                            )
+                            fields = {k.strip(): k.strip() for k in raw.split(",") if k.strip()}
+                    if fields:
+                        credentials_path = collect_and_write_credentials(
+                            fields,
+                            creds_label,
+                            secrets_root,
+                            uid,
+                            gid,
+                            optional=optional,
+                        )
+                if credentials_path:
+                    state.set("certbot_credentials_path", credentials_path)
+                state.complete("certbot_credentials")
             else:
                 credentials_path = state.get("certbot_credentials_path")
 
