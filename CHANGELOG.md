@@ -129,6 +129,27 @@ and `README.md`.
   plugins via `snap` instead, with a clear error when a custom git/pip plugin is
   requested under snap.
 
+### Added (deploy key & Infisical import)
+
+- **Password-protected SSH deploy keys.** When generating a deploy key the
+  installer now asks whether to protect it with a passphrase; when reusing an
+  existing/supplied key it detects encryption and prompts for the passphrase
+  (verifying it unlocks the key). The passphrase is stored in the state file and
+  a `secrets/deploy_key_passphrase` (0600, never pushed to SCM), migrated to
+  Infisical (`AWX_DEPLOY_KEY_PASSPHRASE`), passed to AWX's Machine and Source
+  Control credentials as `ssh_key_unlock` (both the Python and playbook paths),
+  and used to transparently unlock the key for the installer's own git
+  operations (a throwaway decrypted copy is used for the clone/push and removed
+  immediately after).
+- **Import data from a previous Infisical instance.** When deploying Infisical
+  the installer offers to import a PostgreSQL dump (default
+  `~ansible/infisical.sql`) into the freshly provisioned database before the
+  container starts, prompting for the old `ENCRYPTION_KEY`/`AUTH_SECRET` and
+  reusing them (instead of generating new ones) so the imported, encrypted
+  secrets stay decryptable. An optional Redis dump (`dump.rdb`) is staged into
+  the Infisical Redis volume. Fresh bootstrap seeding/secret-migration is skipped
+  in import mode so the imported admin/org/projects are preserved.
+
 ### Added (DNS)
 
 - Expanded the Certbot DNS provider list to ~30 verified plugins, presented as a

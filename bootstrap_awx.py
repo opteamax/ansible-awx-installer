@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import getpass
 import glob
@@ -450,6 +451,7 @@ class Config:
     awx_listen_port: int = AWX_DEFAULT_PORT
     git_ssh_url: str = ""
     git_branch: str = "main"
+    deploy_key_passphrase: str = ""  # secret — set when the deploy key is encrypted
     awx_image_tag: str = AWX_FALLBACK_TAG
     redis_image_tag: str = REDIS_DEFAULT_TAG
     postgres_image_tag: str = POSTGRES_DEFAULT_TAG
@@ -474,6 +476,17 @@ class Config:
     # them is AWX's db_user with the AWX db password the installer generates.
     infisical_db_name: str = "infisical"
     infisical_db_user: str = "infisical"
+    # --- Import data from a previous Infisical instance ---
+    # When enabled, a PostgreSQL dump (pg_dump) of the old Infisical database is
+    # loaded into the freshly provisioned infisical DB before the container
+    # starts, and the old ENCRYPTION_KEY/AUTH_SECRET are reused (NOT regenerated)
+    # so the imported, encrypted secrets remain decryptable. An optional Redis
+    # dump (dump.rdb) can be restored too.
+    infisical_import_enabled: bool = False
+    infisical_import_sql_path: str = ""        # path to the pg_dump .sql file
+    infisical_import_redis_path: str = ""      # path to the old redis dump.rdb (optional)
+    infisical_import_encryption_key: str = ""  # secret — old ENCRYPTION_KEY
+    infisical_import_auth_secret: str = ""     # secret — old AUTH_SECRET
     # Optional SMTP smart-host relay (blank host = disabled). Password is a secret.
     # Transport: STARTTLS (explicit upgrade, usually :587) or SMTPS (implicit TLS,
     # usually :465). SMTP_AUTH uses the username/password below.
@@ -931,7 +944,10 @@ def prompt_confirm(label: str, default: bool = False) -> bool:
 # excluded because they are re-set on every run from the environment.
 _ANSWERS_EXCLUDE: frozenset = frozenset({
     "awx_admin_password",   # secret — kept only in the encrypted state file
+    "deploy_key_passphrase",  # secret — kept only in the state file / secrets dir
     "infisical_client_secret",  # secret
+    "infisical_import_encryption_key",  # secret
+    "infisical_import_auth_secret",  # secret
     "infisical_smtp_password",  # secret
     "netbox_token",         # secret
     "ldap_bind_password",   # secret
@@ -1329,6 +1345,45 @@ def collect_params(
             "Infisical container image",
             default=answers.get("infisical_image", cfg.infisical_image),
         )
+
+        # ── Import data from a previous Infisical instance ──────────
+        default_sql = answers.get("infisical_import_sql_path", "") or str(
+            Path(cfg.ansible_home) / "infisical.sql"
+        )
+        print(
+            "  You can migrate an existing Infisical instance by importing a\n"
+            "  PostgreSQL dump (pg_dump) of its database. The old encryption keys\n"
+            "  are required so the imported secrets stay decryptable."
+        )
+        cfg.infisical_import_enabled = prompt_confirm(
+            "Import data from a previous Infisical instance?",
+            default=bool(answers.get("infisical_import_enabled", False)),
+        )
+        if cfg.infisical_import_enabled:
+            cfg.infisical_import_sql_path = prompt(
+                "Path to the Infisical PostgreSQL dump (.sql)",
+                default=default_sql,
+                validator=lambda v: None if Path(v).expanduser().is_file()
+                else "File not found",
+            )
+            print(
+                "  Enter the OLD instance's ENCRYPTION_KEY and AUTH_SECRET exactly\n"
+                "  (from its environment). They will be reused instead of generating\n"
+                "  new ones, otherwise the imported secrets cannot be decrypted."
+            )
+            cfg.infisical_import_encryption_key = prompt_password(
+                "Old Infisical ENCRYPTION_KEY"
+            )
+            cfg.infisical_import_auth_secret = prompt_password(
+                "Old Infisical AUTH_SECRET"
+            )
+            cfg.infisical_import_redis_path = prompt(
+                "Path to an old Redis dump (dump.rdb) to restore (blank to skip)",
+                default=answers.get("infisical_import_redis_path", ""),
+                required=False,
+                validator=lambda v: None if (not v or Path(v).expanduser().is_file())
+                else "File not found",
+            )
         cfg.infisical_smtp_host = prompt(
             "SMTP smart-host for Infisical email (leave blank to disable)",
             default=answers.get("infisical_smtp_host", ""),
@@ -1672,8 +1727,18 @@ def generate_and_write_secrets(
 
     # --- Infisical secrets (shares AWX's PostgreSQL container) ---
     if config.infisical_enabled:
-        inf_encryption_key = state.get("infisical_encryption_key") or _secrets_mod.token_hex(16)
-        inf_auth_secret = state.get("infisical_auth_secret") or generate_secret(32)
+        # When importing a previous instance, the OLD ENCRYPTION_KEY/AUTH_SECRET
+        # must be reused so the imported (encrypted) secrets stay decryptable.
+        inf_encryption_key = (
+            state.get("infisical_encryption_key")
+            or (config.infisical_import_encryption_key if config.infisical_import_enabled else "")
+            or _secrets_mod.token_hex(16)
+        )
+        inf_auth_secret = (
+            state.get("infisical_auth_secret")
+            or (config.infisical_import_auth_secret if config.infisical_import_enabled else "")
+            or generate_secret(32)
+        )
         inf_db_password = state.get("infisical_db_password") or _secrets_mod.token_hex(24)
         # Admin password for the Infisical instance admin created during seeding.
         # Reuse the AWX admin password so the operator logs in to Infisical with
@@ -1758,29 +1823,26 @@ def _find_cwd_key_pair() -> Optional[Tuple[Path, Path]]:
     return None
 
 
-def generate_deploy_key(path: Path, comment: str, fips: bool) -> None:
-    """Generate SSH deploy key. Uses RSA-4096 in FIPS mode, ed25519 otherwise.
+def _key_is_encrypted(path: Path) -> bool:
+    """Return True if the private key at `path` is passphrase-protected.
 
-    If CWD/keys/ contains a matching private+public key pair, those are copied
-    instead of generating new ones.
+    `ssh-keygen -y` with an empty passphrase exports the public key only for an
+    unencrypted key; for an encrypted one it fails ("incorrect passphrase").
     """
-    if path.exists():
-        log.info("Deploy key already exists at %s, skipping generation.", path)
-        return
+    return not run_ok(["ssh-keygen", "-y", "-P", "", "-f", str(path)])
 
-    pair = _find_cwd_key_pair()
-    if pair is not None:
-        src_priv, src_pub = pair
-        log.info("Reusing existing key pair from %s.", src_priv.parent)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_priv, path)
-        path.chmod(0o600)
-        pub_dst = path.with_suffix(".pub")
-        shutil.copy2(src_pub, pub_dst)
-        pub_dst.chmod(0o644)
-        log.info("Key pair copied: %s", path)
-        return
 
+def _passphrase_unlocks(path: Path, passphrase: str) -> bool:
+    """Return True if `passphrase` successfully unlocks the private key."""
+    return run_ok(["ssh-keygen", "-y", "-P", passphrase, "-f", str(path)])
+
+
+def generate_deploy_key(path: Path, comment: str, fips: bool, passphrase: str = "") -> None:
+    """Generate an SSH deploy key. RSA-4096 in FIPS mode, ed25519 otherwise.
+
+    `passphrase` empty -> unencrypted key; non-empty -> the key is encrypted
+    with it.
+    """
     if fips:
         key_type = ["-t", "rsa", "-b", "4096"]
         log.info("FIPS mode detected – generating RSA-4096 deploy key.")
@@ -1794,14 +1856,93 @@ def generate_deploy_key(path: Path, comment: str, fips: bool) -> None:
             *key_type,
             "-C", comment,
             "-f", str(path),
-            "-N", "",  # no passphrase
+            "-N", passphrase,
         ]
     )
     path.chmod(0o600)
     pub = path.with_suffix(".pub")
     if pub.exists():
         pub.chmod(0o644)
-    log.info("Deploy key generated: %s", path)
+    log.info("Deploy key generated: %s (%s).", path,
+             "passphrase-protected" if passphrase else "no passphrase")
+
+
+def setup_deploy_key(path: Path, comment: str, fips: bool, config: Config) -> None:
+    """Place or generate the deploy key, handling passphrase-encrypted keys.
+
+    - An already-present key (left from a prior run) or a key pair found under
+      CWD/keys/ is reused; if it is encrypted, the operator is prompted for the
+      passphrase (unless one already stored in the config unlocks it).
+    - Otherwise a fresh key is generated, after asking whether it should be
+      protected with a passphrase.
+
+    The resolved passphrase (empty when unencrypted) is stored on `config`.
+    """
+    if not path.exists():
+        pair = _find_cwd_key_pair()
+        if pair is not None:
+            src_priv, src_pub = pair
+            log.info("Reusing existing key pair from %s.", src_priv.parent)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_priv, path)
+            path.chmod(0o600)
+            pub_dst = path.with_suffix(".pub")
+            shutil.copy2(src_pub, pub_dst)
+            pub_dst.chmod(0o644)
+            log.info("Key pair copied: %s", path)
+
+    if path.exists():
+        # Existing/copied key: detect encryption and obtain the passphrase.
+        if _key_is_encrypted(path):
+            stored = config.deploy_key_passphrase
+            if stored and _passphrase_unlocks(path, stored):
+                log.info("Encrypted deploy key unlocked with stored passphrase.")
+            else:
+                print("\nThe deploy key at %s is passphrase-protected." % path)
+                while True:
+                    pp = prompt_password("Enter the deploy key passphrase")
+                    if _passphrase_unlocks(path, pp):
+                        config.deploy_key_passphrase = pp
+                        break
+                    print("  Incorrect passphrase – please try again.")
+        else:
+            config.deploy_key_passphrase = ""
+        return
+
+    # Fresh generation.
+    passphrase = ""
+    if prompt_confirm(
+        "Protect the deploy key with a passphrase (encrypted private key)?",
+        default=False,
+    ):
+        while True:
+            p1 = prompt_password("Deploy key passphrase")
+            p2 = prompt_password("Confirm passphrase")
+            if p1 != p2:
+                print("  Passphrases do not match – please try again.")
+                continue
+            passphrase = p1
+            break
+    generate_deploy_key(path, comment, fips, passphrase=passphrase)
+    config.deploy_key_passphrase = passphrase
+
+
+def deploy_key_passphrase_path(home: str) -> Path:
+    """Path to the local secret holding the deploy key passphrase."""
+    return Path(home) / "secrets" / "deploy_key_passphrase"
+
+
+def write_deploy_key_passphrase_file(home: str, passphrase: str, uid: int, gid: int) -> None:
+    """Persist (or remove) the deploy key passphrase as a 0600 secrets file.
+
+    Kept out of group_vars/scaffold so it is never pushed to the SCM repo; the
+    AWX credential task slurps it (or reads it from Infisical) as ssh_key_unlock.
+    """
+    path = deploy_key_passphrase_path(home)
+    if passphrase:
+        write_secret_file(path, passphrase, uid, gid)
+    elif path.exists():
+        path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -3116,6 +3257,41 @@ def gen_role_tasks_credentials(config: Config) -> str:
         _deploy_key: "{{ _deploy_key_raw.content | b64decode }}"
       no_log: true
 
+# The passphrase (ssh_key_unlock) is only needed for an encrypted deploy key.
+# Read from Infisical when available, else from the local secrets file (which is
+# absent for unencrypted keys, leaving the unlock empty).
+- name: Fetch deploy key passphrase from Infisical
+  ansible.builtin.set_fact:
+    _deploy_key_unlock: >-
+      {{ lookup('infisical', 'AWX_DEPLOY_KEY_PASSPHRASE',
+                url=infisical_url, project_id=infisical_project_id,
+                env_slug=infisical_env, token=infisical_token,
+                client_id=infisical_client_id, client_secret=infisical_client_secret,
+                default='') }}
+  no_log: true
+  when: infisical_available | default(false) | bool
+
+- name: Read deploy key passphrase from file (fallback)
+  when: _deploy_key_unlock | default('') | length == 0
+  block:
+    - name: Check for deploy key passphrase file
+      ansible.builtin.stat:
+        path: "{{ ansible_home }}/secrets/deploy_key_passphrase"
+      register: _deploy_key_unlock_stat
+
+    - name: Slurp deploy key passphrase
+      ansible.builtin.slurp:
+        src: "{{ ansible_home }}/secrets/deploy_key_passphrase"
+      register: _deploy_key_unlock_raw
+      no_log: true
+      when: _deploy_key_unlock_stat.stat.exists
+
+    - name: Set deploy key passphrase fact from file
+      ansible.builtin.set_fact:
+        _deploy_key_unlock: "{{ _deploy_key_unlock_raw.content | b64decode }}"
+      no_log: true
+      when: _deploy_key_unlock_stat.stat.exists
+
 - name: Ensure machine credential 'deploy_key' exists
   awx.awx.credential:
     name: "{{ awx_machine_credential_name }}"
@@ -3124,6 +3300,7 @@ def gen_role_tasks_credentials(config: Config) -> str:
     state: present
     inputs:
       ssh_key_data: "{{ _deploy_key }}"
+      ssh_key_unlock: "{{ _deploy_key_unlock | default('') }}"
     controller_host: "{{ awx_api_url }}"
     controller_oauthtoken: "{{ awx_api_token }}"
   no_log: true
@@ -3138,6 +3315,7 @@ def gen_role_tasks_credentials(config: Config) -> str:
     state: present
     inputs:
       ssh_key_data: "{{ _deploy_key }}"
+      ssh_key_unlock: "{{ _deploy_key_unlock | default('') }}"
     controller_host: "{{ awx_api_url }}"
     controller_oauthtoken: "{{ awx_api_token }}"
   no_log: true
@@ -4773,17 +4951,41 @@ def awx_wait_for_project_sync(
     )
 
 
-def _git_env_with_deploy_key(home: str) -> Dict[str, str]:
-    """Return environment with deploy key injected for git/ssh commands."""
+@contextlib.contextmanager
+def _git_env_with_deploy_key(home: str, passphrase: str = ""):
+    """Yield an environment with the deploy key injected for git/ssh commands.
+
+    git+ssh has no non-interactive way to supply a key passphrase, so when the
+    deploy key is encrypted we write a throwaway decrypted copy (0600, in a
+    private temp dir) for the duration of the git operations and remove it on
+    exit. Unencrypted keys are used directly.
+    """
     key_path = Path(home) / "keys" / "deploy_key"
     if not key_path.exists():
         raise RuntimeError(f"Deploy key not found at {key_path}")
-    ssh_cmd = (
-        f"ssh -i {key_path} "
-        "-o IdentitiesOnly=yes "
-        "-o StrictHostKeyChecking=accept-new"
-    )
-    return {"GIT_SSH_COMMAND": ssh_cmd}
+
+    tmp_dir: Optional[str] = None
+    use_key = key_path
+    try:
+        if passphrase:
+            tmp_dir = tempfile.mkdtemp(prefix="awx_deploykey_")
+            os.chmod(tmp_dir, 0o700)
+            tmp_key = Path(tmp_dir) / "deploy_key"
+            shutil.copy2(key_path, tmp_key)
+            tmp_key.chmod(0o600)
+            # Strip the passphrase from the copy (original stays encrypted).
+            run(["ssh-keygen", "-p", "-f", str(tmp_key), "-P", passphrase, "-N", ""],
+                capture=True)
+            use_key = tmp_key
+        ssh_cmd = (
+            f"ssh -i {use_key} "
+            "-o IdentitiesOnly=yes "
+            "-o StrictHostKeyChecking=accept-new"
+        )
+        yield {"GIT_SSH_COMMAND": ssh_cmd}
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _sync_tree_without_git(source: Path, target: Path) -> None:
@@ -4916,141 +5118,141 @@ def seed_blank_repo_from_current_awx(
         assume_git_key_ready=assume_git_key_ready,
     )
 
-    git_env = _git_env_with_deploy_key(home)
-    ls_remote_result = run(
-        ["git", "ls-remote", "--heads", config.git_ssh_url],
-        env=git_env,
-        capture=True,
-        check=False,
-    )
-    if ls_remote_result.returncode != 0:
-        err = (ls_remote_result.stderr or ls_remote_result.stdout or "").strip()
-        raise RuntimeError(
-            "Could not access target repository with deploy key. "
-            f"Repository: {config.git_ssh_url}. "
-            f"git ls-remote exit={ls_remote_result.returncode}. "
-            f"Details: {err}"
+    with _git_env_with_deploy_key(home, config.deploy_key_passphrase) as git_env:
+        ls_remote_result = run(
+            ["git", "ls-remote", "--heads", config.git_ssh_url],
+            env=git_env,
+            capture=True,
+            check=False,
         )
-    ls_heads = ls_remote_result.stdout.strip()
-    repo_is_blank = not bool(ls_heads)
+        if ls_remote_result.returncode != 0:
+            err = (ls_remote_result.stderr or ls_remote_result.stdout or "").strip()
+            raise RuntimeError(
+                "Could not access target repository with deploy key. "
+                f"Repository: {config.git_ssh_url}. "
+                f"git ls-remote exit={ls_remote_result.returncode}. "
+                f"Details: {err}"
+            )
+        ls_heads = ls_remote_result.stdout.strip()
+        repo_is_blank = not bool(ls_heads)
 
-    required_paths = ["README.md", "playbooks", "roles", "inventories"]
+        required_paths = ["README.md", "playbooks", "roles", "inventories"]
 
-    with tempfile.TemporaryDirectory(prefix="awx_repo_seed_") as tmpdir:
-        target_worktree = Path(tmpdir) / "target"
-        run(["git", "clone", config.git_ssh_url, str(target_worktree)], env=git_env, check=True)
+        with tempfile.TemporaryDirectory(prefix="awx_repo_seed_") as tmpdir:
+            target_worktree = Path(tmpdir) / "target"
+            run(["git", "clone", config.git_ssh_url, str(target_worktree)], env=git_env, check=True)
 
-        if repo_is_blank:
-            run(["git", "checkout", "--orphan", config.git_branch], cwd=str(target_worktree), check=True)
-        else:
-            # Move to target branch if it exists; otherwise create it from current HEAD.
-            branch_exists = run(
-                ["git", "show-ref", "--verify", f"refs/remotes/origin/{config.git_branch}"],
-                cwd=str(target_worktree),
-                check=False,
-                capture=True,
-            ).returncode == 0
-            if branch_exists:
-                run(["git", "checkout", "-B", config.git_branch, f"origin/{config.git_branch}"], cwd=str(target_worktree), check=True)
+            if repo_is_blank:
+                run(["git", "checkout", "--orphan", config.git_branch], cwd=str(target_worktree), check=True)
             else:
-                run(["git", "checkout", "-B", config.git_branch], cwd=str(target_worktree), check=True)
+                # Move to target branch if it exists; otherwise create it from current HEAD.
+                branch_exists = run(
+                    ["git", "show-ref", "--verify", f"refs/remotes/origin/{config.git_branch}"],
+                    cwd=str(target_worktree),
+                    check=False,
+                    capture=True,
+                ).returncode == 0
+                if branch_exists:
+                    run(["git", "checkout", "-B", config.git_branch, f"origin/{config.git_branch}"], cwd=str(target_worktree), check=True)
+                else:
+                    run(["git", "checkout", "-B", config.git_branch], cwd=str(target_worktree), check=True)
 
-        missing_paths = [p for p in required_paths if not (target_worktree / p).exists()]
-        if not repo_is_blank and not missing_paths and not force_reseed:
-            log.info(
-                "Target repository %s already contains required scaffold; no population needed.",
-                config.git_ssh_url,
-            )
-            state.set(seeded_key, True)
-            return
+            missing_paths = [p for p in required_paths if not (target_worktree / p).exists()]
+            if not repo_is_blank and not missing_paths and not force_reseed:
+                log.info(
+                    "Target repository %s already contains required scaffold; no population needed.",
+                    config.git_ssh_url,
+                )
+                state.set(seeded_key, True)
+                return
 
-        if repo_is_blank:
-            should_populate = True
-            log.info("Target repository %s is blank; preparing initial scaffold population.", config.git_ssh_url)
-        elif force_reseed:
-            should_populate = True
-            log.info(
-                "--force-pull: re-seeding installer-managed scaffold files into "
-                "existing repository %s (overwrites ansible.cfg, "
-                "collections/requirements.yml, README, and the playbooks/roles/"
-                "inventories trees; only the delta is committed).",
-                config.git_ssh_url,
-            )
-        else:
-            if non_interactive:
-                if not assume_git_key_ready:
-                    raise RuntimeError(
-                        "Target repository is missing required scaffold paths "
-                        f"({', '.join(missing_paths)}). Re-run interactively to confirm population, "
-                        "or use --assume-git-key-ready for automated population."
-                    )
+            if repo_is_blank:
+                should_populate = True
+                log.info("Target repository %s is blank; preparing initial scaffold population.", config.git_ssh_url)
+            elif force_reseed:
                 should_populate = True
                 log.info(
-                    "Non-interactive mode with --assume-git-key-ready: auto-populating missing scaffold paths: %s",
-                    ", ".join(missing_paths),
+                    "--force-pull: re-seeding installer-managed scaffold files into "
+                    "existing repository %s (overwrites ansible.cfg, "
+                    "collections/requirements.yml, README, and the playbooks/roles/"
+                    "inventories trees; only the delta is committed).",
+                    config.git_ssh_url,
                 )
             else:
-                print("\nTarget repository is not fully populated for AWX automation.")
-                print("Missing paths:", ", ".join(missing_paths))
-                should_populate = prompt_confirm(
-                    "Populate missing repository structure from bootstrap scaffold now?",
-                    default=True,
-                )
-            if not should_populate:
-                raise RuntimeError("Repository population was declined by operator.")
-
-        # For blank repos, start from a clean tree. For non-blank repos,
-        # preserve existing files and layer scaffold on top.
-        if repo_is_blank:
-            for item in list(target_worktree.iterdir()):
-                if item.name == ".git":
-                    continue
-                if item.is_dir():
-                    shutil.rmtree(item)
+                if non_interactive:
+                    if not assume_git_key_ready:
+                        raise RuntimeError(
+                            "Target repository is missing required scaffold paths "
+                            f"({', '.join(missing_paths)}). Re-run interactively to confirm population, "
+                            "or use --assume-git-key-ready for automated population."
+                        )
+                    should_populate = True
+                    log.info(
+                        "Non-interactive mode with --assume-git-key-ready: auto-populating missing scaffold paths: %s",
+                        ", ".join(missing_paths),
+                    )
                 else:
-                    item.unlink()
+                    print("\nTarget repository is not fully populated for AWX automation.")
+                    print("Missing paths:", ", ".join(missing_paths))
+                    should_populate = prompt_confirm(
+                        "Populate missing repository structure from bootstrap scaffold now?",
+                        default=True,
+                    )
+                if not should_populate:
+                    raise RuntimeError("Repository population was declined by operator.")
 
-        copied = _prepare_seed_source_from_local_scaffold(home, target_worktree)
-        if copied:
-            log.info(
-                "Seed source: local scaffold under %s (no access to existing AWX project repositories).",
-                home,
+            # For blank repos, start from a clean tree. For non-blank repos,
+            # preserve existing files and layer scaffold on top.
+            if repo_is_blank:
+                for item in list(target_worktree.iterdir()):
+                    if item.name == ".git":
+                        continue
+                    if item.is_dir():
+                        shutil.rmtree(item)
+                    else:
+                        item.unlink()
+
+            copied = _prepare_seed_source_from_local_scaffold(home, target_worktree)
+            if copied:
+                log.info(
+                    "Seed source: local scaffold under %s (no access to existing AWX project repositories).",
+                    home,
+                )
+
+            if not copied:
+                raise RuntimeError(
+                    "Could not find local scaffold seed content under ansible home."
+                )
+
+            run(["git", "add", "-A"], cwd=str(target_worktree), check=True)
+            delta = run(
+                ["git", "status", "--porcelain"],
+                cwd=str(target_worktree),
+                capture=True,
+                check=True,
+            ).stdout.strip()
+            if not delta:
+                log.info("Seed content already present in target repository; nothing to commit.")
+                state.set(seeded_key, True)
+                return
+
+            committer_email = config.awx_admin_email or config.admin_email or "awx-bootstrap@localhost"
+            run(["git", "config", "user.name", "AWX Bootstrap"], cwd=str(target_worktree), check=True)
+            run(["git", "config", "user.email", committer_email], cwd=str(target_worktree), check=True)
+            run(
+                ["git", "commit", "-m", "Initial seed from current AWX repository content"],
+                cwd=str(target_worktree),
+                check=True,
+            )
+            run(
+                ["git", "push", "-u", "origin", f"HEAD:{config.git_branch}"],
+                cwd=str(target_worktree),
+                env=git_env,
+                check=True,
             )
 
-        if not copied:
-            raise RuntimeError(
-                "Could not find local scaffold seed content under ansible home."
-            )
-
-        run(["git", "add", "-A"], cwd=str(target_worktree), check=True)
-        delta = run(
-            ["git", "status", "--porcelain"],
-            cwd=str(target_worktree),
-            capture=True,
-            check=True,
-        ).stdout.strip()
-        if not delta:
-            log.info("Seed content already present in target repository; nothing to commit.")
-            state.set(seeded_key, True)
-            return
-
-        committer_email = config.awx_admin_email or config.admin_email or "awx-bootstrap@localhost"
-        run(["git", "config", "user.name", "AWX Bootstrap"], cwd=str(target_worktree), check=True)
-        run(["git", "config", "user.email", committer_email], cwd=str(target_worktree), check=True)
-        run(
-            ["git", "commit", "-m", "Initial seed from current AWX repository content"],
-            cwd=str(target_worktree),
-            check=True,
-        )
-        run(
-            ["git", "push", "-u", "origin", f"HEAD:{config.git_branch}"],
-            cwd=str(target_worktree),
-            env=git_env,
-            check=True,
-        )
-
-    state.set(seeded_key, True)
-    log.info("Repository scaffold population completed for %s on branch %s.", config.git_ssh_url, config.git_branch)
+        state.set(seeded_key, True)
+        log.info("Repository scaffold population completed for %s on branch %s.", config.git_ssh_url, config.git_branch)
 
 
 def _awx_token(home: str) -> Optional[str]:
@@ -5574,7 +5776,9 @@ def awx_bootstrap(
         machine_cred_id = int(existing_machine_cred["id"])
         log.info("Machine credential '%s' already exists (id=%d).", key_name, machine_cred_id)
     else:
-        private_key_content = key_path.read_text()
+        machine_inputs = {"ssh_key_data": key_path.read_text()}
+        if config.deploy_key_passphrase:
+            machine_inputs["ssh_key_unlock"] = config.deploy_key_passphrase
         status, body = awx_api_call(
             "POST",
             base_url,
@@ -5584,7 +5788,7 @@ def awx_bootstrap(
                 "name": key_name,
                 "credential_type": machine_type_id,
                 "organization": org_id,
-                "inputs": {"ssh_key_data": private_key_content},
+                "inputs": machine_inputs,
             },
         )
         if status not in (200, 201):
@@ -5607,7 +5811,9 @@ def awx_bootstrap(
             scm_cred_id = int(existing_scm_cred["id"])
             log.info("SCM credential '%s' already exists (id=%d).", scm_name, scm_cred_id)
         else:
-            private_key_content = key_path.read_text()
+            scm_inputs = {"ssh_key_data": key_path.read_text()}
+            if config.deploy_key_passphrase:
+                scm_inputs["ssh_key_unlock"] = config.deploy_key_passphrase
             status, body = awx_api_call(
                 "POST",
                 base_url,
@@ -5617,7 +5823,7 @@ def awx_bootstrap(
                     "name": scm_name,
                     "credential_type": scm_type_id,
                     "organization": org_id,
-                    "inputs": {"ssh_key_data": private_key_content},
+                    "inputs": scm_inputs,
                 },
             )
             if status not in (200, 201):
@@ -6335,6 +6541,71 @@ def provision_infisical_db(
     log.info("Infisical database '%s' / role '%s' ready.", dbname, user)
 
 
+def import_infisical_data(
+    config: Config,
+    home: str,
+    compose_cmd: List[str],
+    state: State,
+) -> None:
+    """Restore a previous Infisical instance's data into the fresh stack.
+
+    Loads a PostgreSQL dump (pg_dump) into the just-provisioned infisical
+    database and, optionally, stages an old Redis dump.rdb into the redis volume.
+    Must run AFTER the DB/role exist and BEFORE the Infisical container starts so
+    its first-run migrations upgrade the imported schema. The old encryption keys
+    were already reused in the generated .env so the imported secrets decrypt.
+    """
+    if not (config.infisical_enabled and config.infisical_import_enabled):
+        return
+    if state.is_complete("infisical_import"):
+        log.info("Infisical data already imported (state checkpoint).")
+        return
+
+    awx_compose = str(Path(home) / "compose" / "awx" / "docker-compose.yml")
+    awx_dir = str(Path(awx_compose).parent)
+
+    # 1) PostgreSQL dump → infisical database (loaded as AWX's superuser over the
+    #    container's local socket; the dump's own OWNER statements apply).
+    sql_path = Path(config.infisical_import_sql_path).expanduser()
+    if not sql_path.is_file():
+        raise SystemExit(f"Infisical import SQL not found: {sql_path}")
+    log.info("Importing Infisical PostgreSQL dump from %s ...", sql_path)
+    res = run(
+        compose_cmd + [
+            "-f", awx_compose, "exec", "-T", "postgres",
+            "psql", "-U", config.db_user, "-d", config.infisical_db_name,
+            "-v", "ON_ERROR_STOP=1",
+        ],
+        cwd=awx_dir,
+        input=sql_path.read_text(),
+        capture=True,
+        check=False,
+    )
+    if res.returncode != 0:
+        raise RuntimeError(
+            f"Infisical SQL import failed (psql exit {res.returncode}): "
+            f"{(res.stderr or '').strip()[:500]}"
+        )
+    log.info("Infisical PostgreSQL data imported.")
+
+    # 2) Optional Redis dump restore: stage dump.rdb into the redis volume while
+    #    the container is stopped, so redis loads it on the subsequent 'up -d'.
+    redis_path = (config.infisical_import_redis_path or "").strip()
+    if redis_path:
+        rdb = Path(redis_path).expanduser()
+        if not rdb.is_file():
+            raise SystemExit(f"Infisical Redis dump not found: {rdb}")
+        log.info("Staging Infisical Redis dump from %s ...", rdb)
+        inf_compose = str(Path(home) / "compose" / "infisical" / "docker-compose.yml")
+        inf_dir = str(Path(inf_compose).parent)
+        run(compose_cmd + ["-f", inf_compose, "up", "-d", "redis"], cwd=inf_dir)
+        run(compose_cmd + ["-f", inf_compose, "stop", "redis"], cwd=inf_dir)
+        run(["docker", "cp", str(rdb), "infisical-redis:/data/dump.rdb"])
+        log.info("Infisical Redis dump staged (loaded on next start).")
+
+    state.complete("infisical_import")
+
+
 def deploy_infisical(
     config: Config,
     home: str,
@@ -6357,6 +6628,10 @@ def deploy_infisical(
             config, home, compose_cmd, state.get("infisical_db_password") or "",
         )
         state.complete("infisical_db")
+
+    # 1b) Optionally import a previous Infisical instance's data into the fresh
+    #     DB (and stage its Redis dump) before the container starts.
+    import_infisical_data(config, home, compose_cmd, state)
 
     # 2) Obtain the certificate for the infisical FQDN. HTTP-01 (acme.sh /
     #    certbot_http) needs nginx serving the infisical vhost on HTTP first.
@@ -6401,6 +6676,14 @@ def seed_infisical(config: Config, home: str, state: State, uid: int, gid: int) 
     Machine Identity (infisical_client_id), seeding is skipped.
     """
     if not config.infisical_enabled:
+        return
+    if config.infisical_import_enabled:
+        log.info(
+            "Infisical: data was imported from a previous instance – skipping "
+            "fresh bootstrap seeding (the imported instance keeps its own admin, "
+            "organization, projects and secrets). Supply a Machine Identity "
+            "(infisical_client_id/secret) to let AWX read secrets from it."
+        )
         return
     if config.infisical_client_id:
         log.info("Infisical: existing Machine Identity supplied – skipping seeding.")
@@ -6519,6 +6802,8 @@ def migrate_secrets_to_infisical(config: Config, home: str, state: State) -> Non
     deploy_key = Path(home) / "keys" / "deploy_key"
     if deploy_key.is_file():
         items["AWX_DEPLOY_PRIVATE_KEY"] = deploy_key.read_text()
+    if config.deploy_key_passphrase:
+        items["AWX_DEPLOY_KEY_PASSPHRASE"] = config.deploy_key_passphrase
 
     def _upsert(name: str, value: str) -> None:
         payload = {
@@ -7165,18 +7450,25 @@ def main() -> None:
     # ── Phase: SSH deploy key ────────────────────────────────────
     deploy_key_path = Path(home) / "keys" / "deploy_key"
     if not state.is_complete("deploy_key"):
-        generate_deploy_key(
+        setup_deploy_key(
             deploy_key_path,
             comment=f"ansible-deploy@{config.fqdn}",
             fips=fips,
+            config=config,
         )
         os.chown(deploy_key_path, uid, gid)
         pub = deploy_key_path.with_suffix(".pub")
         if pub.exists():
             os.chown(pub, uid, gid)
+        # Persist the (possibly newly captured) passphrase: in the state config
+        # blob and as a 0600 secrets file the AWX credential task can slurp.
+        state.set("config", dataclasses.asdict(config))
+        write_deploy_key_passphrase_file(home, config.deploy_key_passphrase, uid, gid)
         state.complete("deploy_key")
     else:
         log.info("Deploy key already generated (state checkpoint).")
+        # Keep the secrets file in sync with the stored passphrase on re-runs.
+        write_deploy_key_passphrase_file(home, config.deploy_key_passphrase, uid, gid)
 
     # ── Phase: Write files ───────────────────────────────────────
     # Always regenerate – idempotent and needed to pick up bootstrap updates.

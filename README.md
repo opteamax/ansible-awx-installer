@@ -197,6 +197,14 @@ Runtime data and generated assets are stored under:
   with no manual environment setup
 - When an existing Machine Identity (`infisical_client_id`) is supplied (seeding
   skipped), still ensures the configured project exists so the lookup matches
+- **Import from a previous Infisical instance:** optionally loads a PostgreSQL
+  dump (`pg_dump`, default `~ansible/infisical.sql`) into the freshly
+  provisioned database before the container starts, reusing the old
+  `ENCRYPTION_KEY`/`AUTH_SECRET` you supply (so the imported encrypted secrets
+  stay decryptable) instead of generating new ones. An optional Redis dump
+  (`dump.rdb`) is staged into the Infisical Redis volume. In import mode the
+  fresh bootstrap seeding and secret migration are skipped so the imported
+  admin/org/projects/secrets are preserved
 
 #### 4.12 NetBox dynamic inventory (optional)
 
@@ -336,6 +344,11 @@ Git:
 
 - git_ssh_url
 - git_branch
+- deploy key passphrase (optional): when generating a key you are asked whether
+  to encrypt it; when reusing an existing/supplied key, encryption is detected
+  and the passphrase prompted. Stored as a secret (not in the answers file),
+  passed to AWX as `ssh_key_unlock`, and used to unlock the key for the
+  installer's own git operations
 
 Image tags:
 
@@ -365,6 +378,10 @@ Infisical (optional secrets manager):
   have a Universal Auth Machine Identity; otherwise one is created during seeding
 - infisical_project_name, infisical_env_slug
 - infisical_user_sync (none | autoinvite | idp)
+- infisical_import_enabled (+ infisical_import_sql_path, infisical_import_redis_path)
+  — import a previous instance's PostgreSQL/Redis dump; the old
+  `ENCRYPTION_KEY`/`AUTH_SECRET` are prompted as secrets and reused so imported
+  secrets stay decryptable
 
 Secrets are kept out of .answers.json and stored under secrets/ (and in state).
 
@@ -681,6 +698,14 @@ Laufzeitdaten und generierte Artefakte liegen standardmäßig unter:
   geseedete Projekt nutzt
 - Bei vorhandener Machine Identity (`infisical_client_id`, Seeding übersprungen)
   wird das konfigurierte Projekt dennoch sichergestellt, damit der Lookup passt
+- **Import einer früheren Infisical-Instanz:** optional wird ein
+  PostgreSQL-Dump (`pg_dump`, Standard `~ansible/infisical.sql`) vor dem Start des
+  Containers in die frisch provisionierte Datenbank geladen. Die alten
+  `ENCRYPTION_KEY`/`AUTH_SECRET` werden abgefragt und wiederverwendet (statt neue
+  zu erzeugen), damit die importierten verschlüsselten Secrets entschlüsselbar
+  bleiben. Ein optionaler Redis-Dump (`dump.rdb`) wird in das Infisical-Redis-
+  Volume eingespielt. Im Import-Modus werden das frische Bootstrap-Seeding und die
+  Secret-Migration übersprungen, damit Admin/Org/Projekte/Secrets erhalten bleiben
 
 #### 4.12 NetBox Dynamic Inventory (optional)
 
@@ -826,6 +851,11 @@ Git:
 
 - git_ssh_url
 - git_branch
+- Deploy-Key-Passphrase (optional): bei Neuerzeugung wird gefragt, ob der
+  Schlüssel verschlüsselt werden soll; bei einem vorhandenen/übergebenen
+  Schlüssel wird die Verschlüsselung erkannt und die Passphrase abgefragt. Wird
+  als Secret gespeichert (nicht in answers), AWX als `ssh_key_unlock` übergeben
+  und zum Entsperren des Schlüssels für die Git-Operationen des Installers genutzt
 
 Image Tags:
 
@@ -855,6 +885,10 @@ Infisical (optionaler Secrets-Manager):
   Universal-Auth Machine Identity existiert; sonst wird beim Seeding eine erstellt
 - infisical_project_name, infisical_env_slug
 - infisical_user_sync (none | autoinvite | idp)
+- infisical_import_enabled (+ infisical_import_sql_path, infisical_import_redis_path)
+  — Import des PostgreSQL-/Redis-Dumps einer früheren Instanz; die alten
+  `ENCRYPTION_KEY`/`AUTH_SECRET` werden als Secrets abgefragt und wiederverwendet,
+  damit importierte Secrets entschlüsselbar bleiben
 
 Secrets werden nicht in .answers.json abgelegt, sondern unter secrets/ (und im State).
 
