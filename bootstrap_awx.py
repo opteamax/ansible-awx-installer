@@ -1867,6 +1867,32 @@ def generate_deploy_key(path: Path, comment: str, fips: bool, passphrase: str = 
              "passphrase-protected" if passphrase else "no passphrase")
 
 
+def ensure_deploy_key_passphrase(path: Path, config: Config) -> None:
+    """Reconcile config.deploy_key_passphrase with the on-disk key.
+
+    If the key is encrypted, ensure we hold a passphrase that unlocks it,
+    prompting if the stored one is missing or wrong. If the key is unencrypted,
+    clear any stale passphrase. Safe to call repeatedly — this also covers keys
+    placed by an older installer run that did not capture the passphrase.
+    """
+    if not path.exists():
+        return
+    if _key_is_encrypted(path):
+        stored = config.deploy_key_passphrase
+        if stored and _passphrase_unlocks(path, stored):
+            log.info("Encrypted deploy key unlocked with stored passphrase.")
+            return
+        print("\nThe deploy key at %s is passphrase-protected." % path)
+        while True:
+            pp = prompt_password("Enter the deploy key passphrase")
+            if _passphrase_unlocks(path, pp):
+                config.deploy_key_passphrase = pp
+                return
+            print("  Incorrect passphrase – please try again.")
+    else:
+        config.deploy_key_passphrase = ""
+
+
 def setup_deploy_key(path: Path, comment: str, fips: bool, config: Config) -> None:
     """Place or generate the deploy key, handling passphrase-encrypted keys.
 
@@ -1893,20 +1919,7 @@ def setup_deploy_key(path: Path, comment: str, fips: bool, config: Config) -> No
 
     if path.exists():
         # Existing/copied key: detect encryption and obtain the passphrase.
-        if _key_is_encrypted(path):
-            stored = config.deploy_key_passphrase
-            if stored and _passphrase_unlocks(path, stored):
-                log.info("Encrypted deploy key unlocked with stored passphrase.")
-            else:
-                print("\nThe deploy key at %s is passphrase-protected." % path)
-                while True:
-                    pp = prompt_password("Enter the deploy key passphrase")
-                    if _passphrase_unlocks(path, pp):
-                        config.deploy_key_passphrase = pp
-                        break
-                    print("  Incorrect passphrase – please try again.")
-        else:
-            config.deploy_key_passphrase = ""
+        ensure_deploy_key_passphrase(path, config)
         return
 
     # Fresh generation.
@@ -7460,15 +7473,15 @@ def main() -> None:
         pub = deploy_key_path.with_suffix(".pub")
         if pub.exists():
             os.chown(pub, uid, gid)
-        # Persist the (possibly newly captured) passphrase: in the state config
-        # blob and as a 0600 secrets file the AWX credential task can slurp.
-        state.set("config", dataclasses.asdict(config))
-        write_deploy_key_passphrase_file(home, config.deploy_key_passphrase, uid, gid)
         state.complete("deploy_key")
     else:
         log.info("Deploy key already generated (state checkpoint).")
-        # Keep the secrets file in sync with the stored passphrase on re-runs.
-        write_deploy_key_passphrase_file(home, config.deploy_key_passphrase, uid, gid)
+    # Always reconcile the passphrase with the on-disk key — covers a key placed
+    # by an earlier installer run (before encrypted-key support) whose passphrase
+    # was never captured, so AWX gets the required ssh_key_unlock.
+    ensure_deploy_key_passphrase(deploy_key_path, config)
+    state.set("config", dataclasses.asdict(config))
+    write_deploy_key_passphrase_file(home, config.deploy_key_passphrase, uid, gid)
 
     # ── Phase: Write files ───────────────────────────────────────
     # Always regenerate – idempotent and needed to pick up bootstrap updates.
