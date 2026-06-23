@@ -2420,6 +2420,17 @@ BROKER_URL = "redis://{}:{}/0".format(
 AWX_ISOLATION_SHOW_PATHS = []
 
 AWX_ISOLATION_BASE_PATH = '/awxdata'
+
+# Broadcast websocket relay (awx.main.wsrelay): the awx_task node connects to the
+# awx_web node to forward live job events. AWX defaults to https://<web>:443, but
+# the web container serves plain HTTP on port 80 over the internal docker network
+# (its nginx proxies /websocket to daphne). Point the relay there so live job
+# output streams instead of failing with "Connect call failed ...:443".
+# BROADCAST_WEBSOCKET_SECRET is supplied via the .awx.env file (shared by both
+# the web and task containers).
+BROADCAST_WEBSOCKET_PROTOCOL = 'http'
+BROADCAST_WEBSOCKET_PORT = 80
+BROADCAST_WEBSOCKET_VERIFY_CERT = False
 """
 
     return header + body

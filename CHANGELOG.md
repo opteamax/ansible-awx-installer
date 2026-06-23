@@ -115,6 +115,13 @@ and `README.md`.
 
 ### Fixed
 
+- **Websocket broadcast relay spammed `Connect call failed ...:443`.** AWX's
+  `awx.main.wsrelay` defaults to `https://<web>:443`, but the `awx_web` container
+  serves plain HTTP on port 80 over the internal docker network, so the
+  task→web relay connection was refused (breaking live job-output streaming).
+  The generated AWX `settings.py` now sets `BROADCAST_WEBSOCKET_PROTOCOL='http'`,
+  `BROADCAST_WEBSOCKET_PORT=80`, `BROADCAST_WEBSOCKET_VERIFY_CERT=False` (mounted
+  into both the web and task containers).
 - **Login over plain HTTP (`ssl_mode: none`) failed with a missing CSRF header.**
   The generated AWX `settings.py` now emits `CSRF_TRUSTED_ORIGINS` for the
   deployment's scheme/host(/port), sets `SECURE_PROXY_SSL_HEADER` (so Django
