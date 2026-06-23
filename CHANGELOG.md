@@ -115,6 +115,14 @@ and `README.md`.
 
 ### Fixed
 
+- **Infisical SQL import aborted on `unrecognized configuration parameter
+  "transaction_timeout"`.** A dump produced by PostgreSQL 17+ `pg_dump` emits
+  session GUCs (e.g. `transaction_timeout`) that an older target server (the
+  default `postgres:16`) rejects, which aborted the import under
+  `ON_ERROR_STOP=1`. The importer now strips those harmless session settings
+  before loading (keeping `ON_ERROR_STOP` for real errors) and, on any remaining
+  "unrecognized configuration parameter" failure, points at the PostgreSQL
+  major-version mismatch.
 - **Websocket broadcast relay spammed `Connect call failed ...:443`.** AWX's
   `awx.main.wsrelay` defaults to `https://<web>:443`, but the `awx_web` container
   serves plain HTTP on port 80 over the internal docker network, so the

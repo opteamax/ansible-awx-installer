@@ -6565,6 +6565,35 @@ def provision_infisical_db(
     log.info("Infisical database '%s' / role '%s' ready.", dbname, user)
 
 
+# Session GUCs that newer pg_dump versions emit at the top of a dump but older
+# target servers reject (aborting the import under ON_ERROR_STOP). They only set
+# session behaviour and have no effect on the imported data, so they are safe to
+# drop. e.g. transaction_timeout was added in PostgreSQL 17.
+_PGDUMP_UNSUPPORTED_GUCS: Tuple[str, ...] = ("transaction_timeout",)
+
+_PGDUMP_GUC_RE = re.compile(
+    r"^\s*SET\s+(" + "|".join(_PGDUMP_UNSUPPORTED_GUCS) + r")\b[^;]*;\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _sanitize_pg_dump(sql: str) -> Tuple[str, List[str]]:
+    """Comment out session-GUC SET statements an older target server can't parse.
+
+    Returns the cleaned SQL and the list of GUC names that were neutralised, so
+    the caller can log what it dropped. Keeps line numbers stable by replacing
+    the statement with a comment rather than deleting the line.
+    """
+    dropped: List[str] = []
+
+    def _replace(match: "re.Match[str]") -> str:
+        dropped.append(match.group(1).lower())
+        return f"-- {match.group(0).strip()}  -- removed: unsupported on target PostgreSQL"
+
+    cleaned = _PGDUMP_GUC_RE.sub(_replace, sql)
+    return cleaned, dropped
+
+
 def import_infisical_data(
     config: Config,
     home: str,
@@ -6594,6 +6623,13 @@ def import_infisical_data(
     if not sql_path.is_file():
         raise SystemExit(f"Infisical import SQL not found: {sql_path}")
     log.info("Importing Infisical PostgreSQL dump from %s ...", sql_path)
+    sql_text, dropped = _sanitize_pg_dump(sql_path.read_text())
+    if dropped:
+        log.info(
+            "Stripped %d session setting(s) the target PostgreSQL does not "
+            "support (%s) — newer pg_dump emits them; they do not affect data.",
+            len(dropped), ", ".join(sorted(set(dropped))),
+        )
     res = run(
         compose_cmd + [
             "-f", awx_compose, "exec", "-T", "postgres",
@@ -6601,14 +6637,22 @@ def import_infisical_data(
             "-v", "ON_ERROR_STOP=1",
         ],
         cwd=awx_dir,
-        input=sql_path.read_text(),
+        input=sql_text,
         capture=True,
         check=False,
     )
     if res.returncode != 0:
+        err = (res.stderr or "").strip()
+        hint = ""
+        if "unrecognized configuration parameter" in err:
+            hint = (
+                " — the dump was produced by a newer PostgreSQL than the target "
+                f"(postgres_image_tag={config.postgres_image_tag}); restore into a "
+                "matching-or-newer major version, or re-dump from the source."
+            )
         raise RuntimeError(
             f"Infisical SQL import failed (psql exit {res.returncode}): "
-            f"{(res.stderr or '').strip()[:500]}"
+            f"{err[:500]}{hint}"
         )
     log.info("Infisical PostgreSQL data imported.")
 
