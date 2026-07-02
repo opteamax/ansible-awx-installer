@@ -548,6 +548,10 @@ class PlatformAdapter:
     def pkg_installed(self, package: str) -> bool:
         raise NotImplementedError
 
+    def pkg_available(self, package: str) -> bool:
+        """Whether `package` exists in the configured OS repositories."""
+        raise NotImplementedError
+
     def service_enable_now(self, name: str) -> None:
         raise NotImplementedError
 
@@ -591,6 +595,11 @@ class RHEL9Adapter(PlatformAdapter):
 
     def pkg_installed(self, package: str) -> bool:
         return run_ok(["rpm", "-q", package])
+
+    def pkg_available(self, package: str) -> bool:
+        # `dnf info` exits 0 for an installed or available package, non-zero
+        # (code 1) when no package matches. EPEL provides the certbot DNS plugins.
+        return run_ok(["dnf", "info", "-q", package])
 
     def service_enable_now(self, name: str) -> None:
         run(["systemctl", "enable", "--now", name])
@@ -658,6 +667,18 @@ class DebianAdapter(PlatformAdapter):
             return "install ok installed" in out
         except subprocess.CalledProcessError:
             return False
+
+    def pkg_available(self, package: str) -> bool:
+        # `apt-cache policy` prints "Candidate: (none)" for an unknown/uninstallable
+        # package and a real version when it can be installed from the repos.
+        try:
+            out = run_capture(["apt-cache", "policy", package])
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return False
+        for line in out.splitlines():
+            if line.strip().startswith("Candidate:"):
+                return line.split(":", 1)[1].strip() not in ("", "(none)")
+        return False
 
     def service_enable_now(self, name: str) -> None:
         run(["systemctl", "enable", name])
@@ -6256,6 +6277,20 @@ def _ensure_pip(python: str, platform_adapter: PlatformAdapter) -> None:
         )
 
 
+def _os_dns_plugin_package(pip_source: str) -> Optional[str]:
+    """Derive the distro package name for a certbot DNS plugin pip package.
+
+    Debian/Ubuntu and RHEL (EPEL) both ship the official plugins as
+    `python3-certbot-dns-<provider>`. Returns None for anything that isn't a
+    `certbot-dns-*` pip package (e.g. a git URL or a third-party name not in the
+    distro repos — the caller checks availability before using this).
+    """
+    pkg = pip_source.strip().lower()
+    if pkg.startswith("certbot-dns-"):
+        return "python3-" + pkg
+    return None
+
+
 def install_dns_plugin(
     source: str,
     name: str,
@@ -6263,8 +6298,14 @@ def install_dns_plugin(
 ) -> str:
     """Install a Certbot DNS plugin from a pip package name or git URL.
 
-    Installs into the environment certbot actually uses (snap or system Python),
-    bootstrapping pip and handling PEP-668 externally-managed environments.
+    Strategy:
+      1. snap-based certbot → install the plugin via snap (pip cannot reach it).
+      2. otherwise prefer the native OS package (apt/dnf) when one exists — this
+         is required on PEP-668 distros like Debian 13 where pip into the system
+         interpreter is blocked, and is cleaner everywhere (deps are managed).
+      3. fall back to pip into the interpreter certbot runs from, bootstrapping
+         pip first and passing --break-system-packages on externally-managed
+         environments.
     Returns the plugin name.
     """
     log.info("Installing DNS plugin '%s' from '%s' ...", name, source)
@@ -6285,6 +6326,22 @@ def install_dns_plugin(
         log.info("DNS plugin installed via snap: %s", source)
         return name
 
+    # 2) Prefer a native distro package when available (e.g.
+    #    python3-certbot-dns-route53 on Debian/Ubuntu or RHEL+EPEL). This avoids
+    #    the PEP-668 "externally-managed-environment" pip block entirely.
+    if not is_git:
+        os_pkg = _os_dns_plugin_package(source)
+        if os_pkg and platform_adapter.pkg_available(os_pkg):
+            log.info("Installing DNS plugin via OS package '%s' ...", os_pkg)
+            platform_adapter.pkg_install([os_pkg])
+            log.info("DNS plugin installed: %s", os_pkg)
+            return name
+        if os_pkg:
+            log.info(
+                "OS package '%s' not available – falling back to pip.", os_pkg
+            )
+
+    # 3) pip into certbot's interpreter (bootstrapping pip; PEP-668 aware).
     _ensure_pip(python, platform_adapter)
     pip_source = (source if source.startswith("git+") else f"git+{source}") if is_git else source
     cmd = [python, "-m", "pip", "install", "--quiet", pip_source]
@@ -6293,7 +6350,7 @@ def install_dns_plugin(
         # certbot-owning system interpreter, which is what certbot imports from.
         cmd.append("--break-system-packages")
     run(cmd)
-    log.info("DNS plugin installed: %s", source)
+    log.info("DNS plugin installed via pip: %s", source)
     return name
 
 

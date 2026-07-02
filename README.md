@@ -118,9 +118,12 @@ Runtime data and generated assets are stored under:
   file is generated automatically; ambient-credential providers (Route 53) and
   file-based credentials (Google service-account JSON) are handled, and a
   `custom` choice installs any other plugin from a pip package or git URL.
-  Plugins are installed into the same Python environment certbot runs from
-  (pip is bootstrapped if missing; PEP-668 externally-managed environments and
-  snap-based certbot are handled).
+  Plugins are installed from the native distro package when one exists (e.g.
+  `python3-certbot-dns-route53` on Debian/Ubuntu or RHEL+EPEL) — which avoids the
+  Debian 13 / PEP-668 `externally-managed-environment` pip block; otherwise they
+  fall back to pip into the environment certbot runs from (pip is bootstrapped if
+  missing and `--break-system-packages` is used on externally-managed systems).
+  snap-based certbot uses snap plugins.
 - For `none` (plain HTTP) deployments, AWX is configured with the matching
   `CSRF_TRUSTED_ORIGINS` and non-secure session/CSRF cookies so login works
   without TLS.
@@ -618,9 +621,13 @@ Laufzeitdaten und generierte Artefakte liegen standardmäßig unter:
   Credentials-Datei automatisch erzeugt; Provider mit Umgebungs-Credentials
   (Route 53) und dateibasierte Credentials (Google Service-Account-JSON) werden
   ebenso unterstützt. Mit der Auswahl `custom` lässt sich jedes weitere Plugin
-  aus einem pip-Paket oder einer Git-URL installieren. Plugins werden in dieselbe
-  Python-Umgebung installiert, aus der certbot läuft (pip wird bei Bedarf
-  bereitgestellt; PEP-668- und Snap-certbot-Umgebungen werden berücksichtigt).
+  aus einem pip-Paket oder einer Git-URL installieren. Plugins werden bevorzugt
+  aus dem nativen Distributionspaket installiert, sofern vorhanden (z. B.
+  `python3-certbot-dns-route53` unter Debian/Ubuntu oder RHEL+EPEL) — das umgeht
+  die PEP-668-Sperre (`externally-managed-environment`) unter Debian 13;
+  andernfalls Fallback auf pip in der certbot-Umgebung (pip wird bei Bedarf
+  bereitgestellt, `--break-system-packages` auf externally-managed-Systemen).
+  Snap-certbot nutzt Snap-Plugins.
 - Bei `none` (reines HTTP) wird AWX mit passenden `CSRF_TRUSTED_ORIGINS` und
   nicht-sicheren Session-/CSRF-Cookies konfiguriert, damit der Login ohne TLS
   funktioniert.

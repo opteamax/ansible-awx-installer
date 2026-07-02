@@ -115,6 +115,13 @@ and `README.md`.
 
 ### Fixed
 
+- **DNS plugin install failed on Debian 13 (`externally-managed-environment`).**
+  Certbot DNS plugins are now installed from the native distro package when one
+  exists (e.g. `python3-certbot-dns-route53` on Debian/Ubuntu or RHEL+EPEL),
+  which sidesteps the PEP-668 pip block entirely and pulls dependencies cleanly.
+  Only when no OS package is available does it fall back to pip (bootstrapping
+  pip if `pip3` is missing, and adding `--break-system-packages` on
+  externally-managed systems). snap-based certbot still uses snap plugins.
 - **Infisical SQL import aborted on `unrecognized configuration parameter
   "transaction_timeout"`.** A dump produced by PostgreSQL 17+ `pg_dump` emits
   session GUCs (e.g. `transaction_timeout`) that an older target server (the
