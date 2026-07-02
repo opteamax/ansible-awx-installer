@@ -67,8 +67,16 @@ KNOWN_DNS_PLUGIN_CREDENTIALS: Dict[str, Any] = {
     },
     "route53": {
         "package": "certbot-dns-route53",
-        "ambient": True,  # AWS credentials via env vars / IAM role / ~/.aws
-        "fields": {},
+        # certbot-dns-route53 uses boto3, which has no --dns-route53-credentials
+        # ini; instead it reads the standard AWS shared-credentials file. We
+        # prompt for the keys and write ~/.aws/credentials (where boto3/certbot
+        # looks, including at renewal time). Leaving the keys blank falls back to
+        # ambient credentials (an EC2 instance/IAM role or pre-set env vars).
+        "aws_credentials": True,
+        "fields": {
+            "aws_access_key_id": "AWS Access Key ID (blank = use IAM role / env)",
+            "aws_secret_access_key": "AWS Secret Access Key",
+        },
     },
     "google": {
         "package": "certbot-dns-google",
@@ -207,7 +215,8 @@ KNOWN_DNS_PLUGIN_CREDENTIALS: Dict[str, Any] = {
             "dns_ionos_endpoint": "API base URL (optional)",
         },
         "optional": {"dns_ionos_endpoint"},
-        "propagation_seconds": 60,
+        # NB: certbot-dns-ionos does not register a --dns-ionos-propagation-seconds
+        # option, so none is set here (run_certbot also strips it on rejection).
     },
     "vultr": {
         "package": "certbot-dns-vultr",
@@ -6445,6 +6454,49 @@ def copy_credential_file(
     return str(dest)
 
 
+def collect_and_write_aws_credentials(fields: Dict[str, str], plugin_name: str) -> bool:
+    """Prompt for AWS keys and write the shared credentials file boto3 reads.
+
+    certbot-dns-route53 authenticates via boto3, which looks in
+    ~/.aws/credentials (for the user running certbot — root here) both at issue
+    and renewal time. Returns True if a file was written, False when the operator
+    left the keys blank (use an ambient IAM role / pre-set env vars instead).
+    """
+    print(f"\nCredentials for DNS plugin '{plugin_name}':")
+    field_items = list(fields.items())
+    first_key, first_label = field_items[0]
+    access_key = prompt(f"  {first_label}", required=False)
+    if not access_key:
+        log.info(
+            "No AWS keys entered for route53 – relying on ambient credentials "
+            "(IAM role / AWS_* environment variables)."
+        )
+        return False
+
+    values = {first_key: access_key}
+    for key, label in field_items[1:]:
+        values[key] = prompt_password(f"  {label}")
+
+    # Write to root's home explicitly (certbot runs as root at both issue and
+    # systemd-timer renewal time) rather than a possibly sudo-inherited $HOME.
+    import pwd
+    root_home = Path(pwd.getpwuid(0).pw_dir)
+    aws_dir = root_home / ".aws"
+    aws_dir.mkdir(parents=True, exist_ok=True)
+    aws_dir.chmod(0o700)
+    creds_path = aws_dir / "credentials"
+    if creds_path.exists():
+        backup = creds_path.with_suffix(".bak")
+        shutil.copy2(creds_path, backup)
+        log.warning("Existing %s backed up to %s before overwrite.", creds_path, backup)
+
+    body = "[default]\n" + "".join(f"{k} = {v}\n" for k, v in values.items())
+    creds_path.write_text(body)
+    creds_path.chmod(0o600)
+    log.info("AWS credentials written to %s (used by certbot-dns-route53).", creds_path)
+    return True
+
+
 def run_certbot(
     config: Config,
     home: str,
@@ -6462,6 +6514,7 @@ def run_certbot(
         "--domains", domain,
     ]
 
+    prop_args: List[str] = []
     if config.ssl_mode == "certbot_http":
         cmd += ["--nginx"]
     elif config.ssl_mode == "certbot_dns":
@@ -6482,12 +6535,31 @@ def run_certbot(
         if credentials_path and not plugin_info.get("ambient"):
             cmd += [creds_arg, credentials_path]
 
+        # Not every third-party plugin registers a propagation-seconds option; it
+        # is applied best-effort and stripped on a retry if certbot rejects it.
         prop = plugin_info.get("propagation_seconds")
         if prop:
-            cmd += [f"--{authenticator}-propagation-seconds", str(prop)]
+            prop_args = [f"--{authenticator}-propagation-seconds", str(prop)]
 
     log.info("Running certbot to obtain certificate for %s ...", config.fqdn)
-    run(cmd)
+    if prop_args:
+        # Capture so we can detect an "unrecognized arguments" argparse failure —
+        # which happens before any ACME request, so retrying without the
+        # propagation flag is safe (no wasted ACME/rate-limit hit).
+        result = run(cmd + prop_args, capture=True, check=False)
+        if result.returncode != 0:
+            output = f"{result.stdout or ''}\n{result.stderr or ''}"
+            if "unrecognized arguments" in output and "propagation-seconds" in output:
+                log.warning(
+                    "Plugin does not support %s – retrying without it.", prop_args[0]
+                )
+                run(cmd, check=True)
+            else:
+                raise RuntimeError(
+                    f"certbot failed (exit {result.returncode}): {output.strip()[:1000]}"
+                )
+    else:
+        run(cmd, check=True)
     log.info("Certificate obtained for %s.", config.fqdn)
 
 
@@ -7645,8 +7717,14 @@ def main() -> None:
 
             if not state.is_complete("certbot_credentials"):
                 secrets_root = str(Path(home) / "secrets")
-                if plugin_info.get("ambient"):
-                    # Provider uses ambient credentials (e.g. route53 via IAM/env vars).
+                if plugin_info.get("aws_credentials"):
+                    # route53: prompt for AWS keys and write ~/.aws/credentials
+                    # (where boto3/certbot look). No certbot --credentials arg.
+                    collect_and_write_aws_credentials(
+                        plugin_info.get("fields", {}), creds_label,
+                    )
+                elif plugin_info.get("ambient"):
+                    # Provider uses ambient credentials (e.g. via IAM/env vars).
                     # No credential file needed; mark phase complete to avoid retrying.
                     log.info(
                         "DNS provider '%s' uses ambient credentials – no file written.",

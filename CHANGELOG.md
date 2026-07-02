@@ -115,6 +115,18 @@ and `README.md`.
 
 ### Fixed
 
+- **Certbot DNS: `unrecognized arguments: --dns-<x>-propagation-seconds`.** Not
+  every third-party plugin (e.g. `certbot-dns-ionos`) registers a
+  propagation-seconds option. The flag is now applied best-effort: on an
+  argparse rejection (which happens before any ACME request, so it is safe)
+  certbot is retried once without it. The known-unsupported `ionos` default was
+  also removed.
+- **route53 now prompts for AWS credentials.** `certbot-dns-route53` authenticates
+  via boto3 (no `--dns-route53-credentials` ini), so the installer prompts for the
+  AWS Access Key ID / Secret Access Key and writes them to root's
+  `~/.aws/credentials` (where boto3/certbot look at both issue and renewal time).
+  Leaving the keys blank falls back to ambient credentials (IAM role / `AWS_*`
+  env vars). (`ionos` already prompts for its `dns_ionos_*` credentials ini.)
 - **DNS plugin install failed on Debian 13 (`externally-managed-environment`).**
   Certbot DNS plugins are now installed from the native distro package when one
   exists (e.g. `python3-certbot-dns-route53` on Debian/Ubuntu or RHEL+EPEL),
